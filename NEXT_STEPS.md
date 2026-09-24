@@ -1,0 +1,9 @@
+# Next steps toward GGUF-only text classification
+
+1. **Tokenizer parity.** Implement the checkpoint's SentencePiece Unigram normalizer, pretokenization, unknown handling, and special token IDs from `tokenizer.json`. The upstream processor lowercases whitespace split text words, builds `("[P]" task "(" "[L]" label ... ")") [SEP_TEXT] text`, tokenizes each segment, and routes the first subword of every marker. Add golden token IDs and marker positions for ASCII, Unicode, punctuation, descriptions, and truncation.
+2. **DeBERTa-v3-large forward graph.** Load encoder tensors from GGUF and implement embeddings, relative positional disentangled attention, layer normalization, and feed-forward layers in GGML. Match the checkpoint's `encoder_config/config.json`, including position attention settings and encoder normalization. Compare every layer against Transformers on a short fixture before optimizing.
+3. **End to end classification.** Connect tokenizer marker positions to encoder states and the existing GGML classifier. Add `gliner_classify_text(context, state, ...)` to the C API and a `--text`, `--task`, `--labels` CLI path. Make model loading validate every tensor required by the encoder and fail clearly on unsupported configurations.
+4. **Parity and decoding.** Compare token IDs, hidden states, raw logits, and chosen labels against upstream on a held-out set. Add exclusive softmax, multi-label thresholds, task prompts, label descriptions, and the upstream decision decoder. Set numerical tolerances separately for F32, F16, and later quantized weights.
+5. **Performance and packaging.** Add quantization, memory-mapped tensors, batching, context-length controls, thread tuning, and backend selection after F32 parity. Benchmark CPU and Metal against upstream for realistic schema sizes.
+
+The current CLI intentionally requires precomputed `[L]` states so it cannot return plausible looking classifications from an incomplete encoder.
