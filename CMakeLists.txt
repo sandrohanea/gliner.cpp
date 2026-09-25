@@ -103,10 +103,16 @@ else()
     target_compile_options(gliner PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-add_executable(gliner-classify examples/classify.cpp)
+add_executable(gliner-classify examples/classify.cpp examples/main.cpp)
 target_link_libraries(gliner-classify PRIVATE gliner)
+add_executable(gliner-bench examples/bench.cpp examples/main.cpp)
+target_link_libraries(gliner-bench PRIVATE gliner)
+target_compile_definitions(gliner-bench PRIVATE
+    GLINER_BENCH_BUILD_TYPE="$<CONFIG>"
+    GLINER_BENCH_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 if(MINGW)
     target_link_options(gliner-classify PRIVATE -municode)
+    target_link_options(gliner-bench PRIVATE -municode)
 endif()
 
 include(CTest)
@@ -128,6 +134,13 @@ if(BUILD_TESTING)
                     "$<TARGET_FILE:gliner-test>" --expect-backend "${GLINER_COMPILED_BACKEND}")
         set_tests_properties(gliner-conversion PROPERTIES LABELS "parity;${GLINER_COMPILED_BACKEND}" TIMEOUT 600)
         list(APPEND GLINER_PARITY_TESTS gliner-conversion)
+        add_test(NAME gliner-benchmark
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_benchmark.py"
+                "${CMAKE_CURRENT_SOURCE_DIR}/convert/convert_hf_to_gguf.py"
+                "$<TARGET_FILE:gliner-bench>" "$<TARGET_FILE:gliner-classify>"
+                --expect-backend "${GLINER_COMPILED_BACKEND}")
+        set_tests_properties(gliner-benchmark PROPERTIES LABELS "benchmark;${GLINER_COMPILED_BACKEND}" TIMEOUT 600)
+        list(APPEND GLINER_PARITY_TESTS gliner-benchmark)
         set(GLINER_PARITY_CHECKPOINT "" CACHE PATH "Optional real checkpoint for live Python parity")
         set(GLINER_PARITY_GGUF "" CACHE FILEPATH "Converted GGUF for live Python parity")
         if(GLINER_PARITY_CHECKPOINT AND GLINER_PARITY_GGUF)

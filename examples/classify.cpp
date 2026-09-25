@@ -1,4 +1,4 @@
-#include "gliner/gliner.h"
+#include "common.h"
 
 #include <algorithm>
 #include <cmath>
@@ -15,97 +15,8 @@
 #include <string>
 #include <vector>
 
-#ifdef _WIN32
-#define NOMINMAX
-#include <windows.h>
-#endif
-
 namespace {
-
-std::vector<std::string> split_labels(const std::string & value) {
-    if (value.empty() || value.back() == ',') throw std::runtime_error("Empty label");
-    std::vector<std::string> result;
-    std::stringstream stream(value);
-    std::string label;
-    while (std::getline(stream, label, ',')) {
-        if (label.empty()) throw std::runtime_error("Empty label");
-        result.push_back(label);
-    }
-    return result;
-}
-
-std::string escape_json(const std::string & value) {
-    std::string result;
-    for (unsigned char c : value) {
-        if (c == '\\' || c == '"') { result += '\\'; result += char(c); }
-        else if (c < 0x20) {
-            const char * hex = "0123456789abcdef";
-            result += "\\u00";
-            result += hex[c >> 4];
-            result += hex[c & 15];
-        } else result += char(c);
-    }
-    return result;
-}
-
-int integer(const std::string & value) {
-    size_t used;
-    const int n = std::stoi(value, &used);
-    if (used != value.size() || n < 0) throw std::invalid_argument("Expected a nonnegative integer");
-    return n;
-}
-
-double number(const std::string & value) {
-    size_t used;
-    const double n = std::stod(value, &used);
-    if (used != value.size() || !std::isfinite(n)) throw std::invalid_argument("Expected a finite number");
-    return n;
-}
-
-struct TaskOptions {
-    std::string name, prompt, activation;
-    std::vector<std::string> labels, description_args;
-    std::vector<std::optional<std::string>> descriptions;
-    std::vector<const char *> label_ptrs, description_ptrs;
-    bool multi_label = false, has_threshold = false;
-    bool comma_labels = false, repeated_labels = false;
-    double temperature = 1.0, threshold = 0.5;
-
-    void validate(bool text_mode) {
-        if (comma_labels && repeated_labels) throw std::invalid_argument("Use either --label or --labels within each task");
-        if (labels.empty()) throw std::invalid_argument("Every task requires labels");
-        if (text_mode && name.empty()) throw std::invalid_argument("--task is required for text inference");
-        if (temperature <= 0 || threshold < 0 || threshold > 1 || (has_threshold && !multi_label)) {
-            throw std::invalid_argument("Invalid task temperature or threshold");
-        }
-        if (activation.empty()) activation = text_mode && !multi_label ? "softmax" : "sigmoid";
-        if (activation != "softmax" && activation != "sigmoid") throw std::invalid_argument("Unknown activation");
-        for (size_t i = 0; i < labels.size(); ++i) {
-            if (labels[i].empty() || std::find(labels.begin(), labels.begin() + i, labels[i]) != labels.begin() + i) {
-                throw std::invalid_argument("Labels must be nonempty and unique within each task");
-            }
-        }
-        descriptions.resize(labels.size());
-        for (const auto & desc : description_args) {
-            const size_t equal = desc.find('=');
-            const auto found = std::find(labels.begin(), labels.end(), desc.substr(0, equal));
-            if (equal == std::string::npos || found == labels.end()) throw std::invalid_argument("Expected --description LABEL=TEXT for the current task");
-            const size_t index = static_cast<size_t>(found - labels.begin());
-            if (descriptions[index]) throw std::invalid_argument("Duplicate label description");
-            descriptions[index] = desc.substr(equal + 1);
-        }
-    }
-
-    gliner_classification_task input() {
-        label_ptrs.clear();
-        description_ptrs.clear();
-        for (size_t i = 0; i < labels.size(); ++i) {
-            label_ptrs.push_back(labels[i].c_str());
-            description_ptrs.push_back(descriptions[i] ? descriptions[i]->c_str() : nullptr);
-        }
-        return {name.c_str(), label_ptrs.data(), static_cast<int>(labels.size()), prompt.c_str(), description_ptrs.data()};
-    }
-};
+using namespace gliner_examples;
 
 void write_result(std::ostream & out, const TaskOptions & task, const gliner_score * scores) {
     const size_t count = task.labels.size();
@@ -184,16 +95,6 @@ void dump_layer(int layer, const float * values, int tokens, int hidden, void * 
         write_u32(out, bits);
     }
     if (!out) throw std::runtime_error("Cannot write hidden-state dump");
-}
-
-template <typename T>
-void array(std::ostream & out, const T * values, size_t size) {
-    out << '[';
-    for (size_t i = 0; i < size; ++i) {
-        if (i) out << ',';
-        out << values[i];
-    }
-    out << ']';
 }
 
 int run(const std::vector<std::string> & args) {
@@ -298,10 +199,7 @@ int run(const std::vector<std::string> & args) {
         int status;
         if (text_mode) {
             if (!text_file.empty()) {
-                std::ifstream input(std::filesystem::u8path(text_file), std::ios::binary);
-                if (!input) throw std::runtime_error("Cannot open text file");
-                text.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
-                if (input.bad()) throw std::runtime_error("Cannot read text file");
+                text = read_text_file(text_file);
             }
             if (text.find('\0') != std::string::npos) throw std::invalid_argument("Text contains NUL");
             std::vector<gliner_classification_task> batch;
@@ -376,19 +274,4 @@ int run(const std::vector<std::string> & args) {
 }
 } // namespace
 
-#ifdef _WIN32
-int wmain(int argc, wchar_t ** argv) {
-    std::vector<std::string> args;
-    for (int i = 0; i < argc; ++i) {
-        const int size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, argv[i], -1, nullptr, 0, nullptr, nullptr);
-        if (!size) { std::cerr << "error: Invalid Unicode argument\n"; return 1; }
-        std::string value(static_cast<size_t>(size), '\0');
-        WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, argv[i], -1, value.data(), size, nullptr, nullptr);
-        value.pop_back();
-        args.push_back(std::move(value));
-    }
-    return run(args);
-}
-#else
-int main(int argc, char ** argv) { return run(std::vector<std::string>(argv, argv + argc)); }
-#endif
+int gliner_cli_main(const std::vector<std::string> & args) { return run(args); }

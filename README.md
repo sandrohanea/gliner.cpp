@@ -1,6 +1,6 @@
 # gliner.cpp
 
-GGML/GGUF inference for [fastino/GLiNER2.5-Decide](https://huggingface.co/fastino/GLiNER2.5-Decide) text classification. CPU is the verified reference backend; CUDA and Metal builds are experimental, pending hardware parity. The CLI runs entirely in C++ from one GGUF file: schema construction, Unicode/Unigram tokenization, the 24-layer DeBERTa-v3-large encoder, contextual `[L]` marker gathering, and the shared classification head.
+GGML/GGUF inference for [fastino/GLiNER2.5-Decide](https://huggingface.co/fastino/GLiNER2.5-Decide) text classification. CPU is the verified reference backend; real-checkpoint F32 CUDA parity has been reported on an RTX 4060 Laptop GPU with the precision settings below. Metal hardware parity remains pending. The CLI runs entirely in C++ from one GGUF file: schema construction, Unicode/Unigram tokenization, the 24-layer DeBERTa-v3-large encoder, contextual `[L]` marker gathering, and the shared classification head.
 
 Despite its name, the published checkpoint uses the **span** architecture. Its classification head is `Linear(H, 2H)`, ReLU, `Linear(2H, 1)` on contextual marker states, not standalone label embeddings.
 
@@ -63,11 +63,20 @@ For a single-configuration generator, omit `Release` from the executable path. U
 
 The CLI and C library do not modify their host's process-wide CUDA environment. Applications embedding gliner must set these variables before initializing CUDA/cuBLAS, including through other libraries. Running without these settings retains GGML's faster reduced-precision defaults and is not covered by the strict parity claim. Disabling TF32 may reduce throughput.
 
-The synthetic CUDA suite was reported passing on an **RTX 4060 Laptop GPU (compute capability 8.9, 8 GiB VRAM)** with TF32 disabled. The same build failed an F32 golden hidden-state comparison with TF32 enabled. Real-checkpoint CUDA parity remains pending; tolerances were not relaxed.
+On **2026-09-25**, the user reported all **13 real-checkpoint F32 parity cases passing on Windows with an RTX 4060 Laptop GPU (compute capability 8.9, 8187 MiB VRAM, VMM enabled)** after the MMF fix below, with both CUDA precision settings shown above. Token IDs, marker positions and task offsets matched exactly; all 25 hidden-state outputs, contextual label states, logits, per-task probabilities and decisions passed the unchanged `atol=rtol=3e-4` comparisons. The maximum absolute hidden-state difference across the run was `0.00010967255` (about `1.10e-4`); the previously failing 12-token case was `1.1920929e-5`. This is a user-supplied hardware result, not a run on this development host. It does not establish real-checkpoint F16 parity, Linux/other-GPU coverage or performance.
+
+The same host also passed all three expanded CUDA CTest tests: `gliner-core`, `gliner-cuda-precision-config` and `gliner-conversion`, including the 32-wide short/long-sequence fixtures. The reported suite duration was 49.59 seconds; this is test-harness duration, not an inference benchmark.
+
+| Recorded build detail | Value |
+|---|---|
+| gliner.cpp revision | `ee9c8a495c224c4fb9b0aab2ca61f1bb0af09765` |
+| GGML revision | `456172ec733a135778adcd32d00e576a58232e45` (v0.24.0, with the generated dispatch overlay) |
+| CUDA compiler/toolkit | CUDA 13.4, `nvcc V13.4.59` |
+| NVIDIA Windows driver | `32.0.15.9155` (reported by `Win32_VideoController`) |
 
 **Short-sequence CUDA fix:** the pinned GGML also has a custom small-matrix (MMF) kernel using explicit TF32 instructions, outside cuBLAS. The cuBLAS environment override does not affect it. A real 22-token case passed on the RTX 4060 with those settings, but the 12-token case failed at encoder layer 1. CMake now builds a generated copy of GGML's CUDA dispatch file that bypasses MMF when F32 activation inputs are requested, allowing the FP32-capable cuBLAS path instead. The original GGML source checkout is not modified. This targeted build-directory fix requires local/fetched GGML source; prebuilt CUDA GGML packages are rejected until an upstream equivalent can be relied on. Unknown dispatch layouts fail configuration rather than silently omitting the fix. CPU and Metal builds do not use the overlay.
 
-After updating these changes, **reconfigure and rebuild** the CUDA build; changing only the environment does not repair an older binary's MMF dispatch. Configuration prints `gliner: applied CUDA F32-input precision fix in the build directory`. Keep the cuBLAS precision environment settings as well. The new 32-wide synthetic fixtures test sequences below and above the small-matrix cutoff; hardware confirmation of the rebuilt runtime is still required.
+After updating these changes, **reconfigure and rebuild** the CUDA build; changing only the environment does not repair an older binary's MMF dispatch. Configuration prints `gliner: applied CUDA F32-input precision fix in the build directory`. Keep the cuBLAS precision environment settings as well. The new 32-wide synthetic fixtures test sequences below and above the small-matrix cutoff. The full real-model run reported above confirms the rebuilt runtime's short-sequence fix on the RTX 4060 Laptop GPU.
 
 **Metal (Apple GPUs, macOS):** use the Xcode command-line tools and Metal toolchain:
 
@@ -161,11 +170,61 @@ The CLI loads the **model once** and reads the input file once. It joins schemas
 
 This is one document with multiple questions, not a padded batch of multiple documents. In the C API, reuse the same context and state across requests to retain model weights and reuse scratch allocations. Input text is not cached across calls, and changing the schema requires a fresh encoder pass.
 
+## Performance benchmark
+
+`gliner-bench` is built alongside `gliner-classify` and uses the same synchronous C API for **CPU, CUDA and Metal**, selected at build time. It loads the model once, reads the text once and reuses execution states. CPU execution has been exercised with the real F32 checkpoint; GPU benchmark runs still need to be collected on hardware.
+
+Start with a Release CPU build:
+
+```powershell
+cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF -DGGML_METAL=OFF
+cmake --build build-cpu --config Release -j 4
+
+.\build-cpu\Release\gliner-bench.exe --model .\models\decide.gguf `
+  --text "Please refund my order; the delivery was late and I am upset." `
+  --task intent --labels refund_request,order_status,other `
+  --task sentiment --labels positive,neutral,negative `
+  --task urgent --labels yes,no `
+  --threads 4 --mode both --warmup 3 --iterations 20 `
+  > .\build-cpu\bench-cpu.json
+
+$bench = Get-Content .\build-cpu\bench-cpu.json -Raw | ConvertFrom-Json
+$bench | Select-Object backend, device, build_type, model_load_ms
+$bench.results | Select-Object mode, tokens_per_request,
+  @{Name="median_ms"; Expression={$_.latency_ms.median}},
+  @{Name="p95_ms"; Expression={$_.latency_ms.p95}},
+  requests_per_second, questions_per_second | Format-Table
+```
+
+With a single-configuration generator (typically Linux/macOS), use the executable directly under the build directory, without `Release`. For CUDA/Metal comparisons, run that backend's `gliner-bench` with **the same GGUF, text, task order, labels, prompts, limits and repetition counts**. The CUDA benchmark needs the documented `NVIDIA_TF32_OVERRIDE=0` and `GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32` launch environment. It records both variables in JSON and warns if those settings are absent; it never modifies them. Backend/device selection remains build-time only.
+
+| Option | Meaning |
+|---|---|
+| `--mode joint\|separate\|both` | Default `both`. Joint answers all questions in one pass; separate runs each question independently against the same loaded model. |
+| `--warmup N` | Additional unmeasured requests after the first request; default 3, may be 0. |
+| `--iterations N` | Measured requests **per mode**; default 20, must be positive. Use more repetitions for meaningful tail percentiles. |
+| `--text` / `--text-file` | Exactly one input, including an empty text if desired. File I/O occurs once, outside inference timing. |
+| `--task`, `--labels` / `--label`, `--prompt`, `--description` | Same task grouping as `gliner-classify`. Decoding options are not accepted: the benchmark measures raw classification, not decisions or formatting. |
+| `--threads`, `--max-words`, `--max-tokens` | Same inference controls as the CLI. The token limit applies per encoder pass, so joint mode must fit all schemas together. |
+
+**What the numbers measure:**
+
+- `model_load_ms`: one model initialization, including metadata/tokenizer/weights and backend initialization/transfers. It is not a guaranteed cold-disk measurement; OS caches may already contain the model.
+- `state_init_ms` and `first_request_ms`: reported separately for each mode. The first request includes initial graph/scratch allocation and possible kernel initialization, and is excluded from the measured samples. Then come `warmup_requests` additional requests, also excluded.
+- `latency_ms`: min, mean, median, p95 and max across `iterations` samples, using a monotonic clock. Percentiles linearly interpolate at `(n - 1) * p`; a one-sample run reports that same value for every percentile. `samples_ms` retains every measured latency.
+- `requests_per_second`: `1000 / mean_latency_ms`. One request answers **all questions**, so separate-mode latency includes all sequential calls. `questions_per_second` multiplies by task count. `encoded_tokens_per_second` counts actual schema-plus-text encoder work, including repeated text in separate mode; it is not unique-document-token throughput.
+
+Timing includes tokenization, graph construction/allocation reuse, synchronized backend execution and the C API's result transfers. GPU timings therefore include completion, not just asynchronous kernel submission. Result checks, JSON formatting, file reading, model loading and state initialization are outside the measured request samples. The output also records backend/device, compiler/build configuration, model path/file size, dimensions, thread count, task definitions, limits, token counts and last logits. It reports text byte length but does not embed the text; retain the input separately for reproducibility.
+
+Joint mode uses one state. Separate mode reuses one state per question to avoid cycling different shapes through the same allocator, while sharing the **same immutable model weights**. Modes run sequentially (`joint` then `separate` for `both`) and their states are freed between modes. The later mode may benefit from process/device caches initialized earlier; its first request is not a fresh-process cold start. For isolated measurements, use separate `--mode joint` and `--mode separate` processes and keep the machine idle. Joint and separate outputs can differ by design; their timing comparison is not a semantic-equivalence claim.
+
+The benchmark does **not** yet sample peak RAM/VRAM, measure concurrent-request serving, generate token-length sweeps or compare result files automatically. `model_file_bytes` is file size, not resident or peak memory. Use external memory monitoring and explicit input files for short/medium/long workloads. Keep CPU/GPU precision settings consistent before interpreting speedups.
+
 ## Python parity
 
 Real-checkpoint F32 parity has been exercised against checkpoint revision `7ee5da4c2415e32259bcdc0b1a7367c32ce8d6f6`, upstream GLiNER2 commit `1a80c9c85272cd6809009b102b770c452e928196`, Transformers 4.48.1 and PyTorch 2.6.0. Eight single-task cases cover ordinary and empty text, Unicode, punctuation, URLs/email, prompts/descriptions containing special markers, empty descriptions, word truncation and logarithmic relative-position buckets. Five additional joint-schema cases cover multiple tasks with different label counts, repeated labels across tasks, prefix-overlapping task names, task order, mixed decoding modes and shared text truncation. The current processor/scorer and span inference semantics were also checked at upstream commit `55656fbfa01d3d4a77485e1a1eeeaf682990ccdf`.
 
-Token IDs, marker positions and task score offsets match exactly. All 25 hidden-state outputs (embeddings plus 24 layers), contextual label states, raw logits, per-task probabilities and chosen labels are compared. The observed maximum absolute hidden-state difference was below `3e-5` for single tasks and `1e-4` for joint schemas; the live comparison uses `atol=rtol=3e-4`. This is numerical parity for the supported classification path, not a claim that every upstream API or decoder is implemented.
+Token IDs, marker positions and task score offsets match exactly. All 25 hidden-state outputs (embeddings plus 24 layers), contextual label states, raw logits, per-task probabilities and chosen labels are compared. On CPU, the observed maximum absolute hidden-state difference was below `3e-5` for single tasks and `1e-4` for joint schemas. The user-reported RTX 4060 Laptop CUDA run passed all 13 cases with a maximum difference of `0.00010967255`. Both use the unchanged live comparison tolerance `atol=rtol=3e-4`. This is numerical parity for the supported classification path and documented configurations, not a claim that every upstream API or decoder is implemented.
 
 The normal CTest suite needs no ML dependencies or downloaded weights. It replays checked-in, deterministic single-task and joint-schema goldens on a complete tiny encoder, checks F32/F16 storage, the C ABI, task grouping/decoding, conversion preservation and error paths. A callback-count assertion verifies one encoder traversal per multi-task call. It also compares file, buffer and non-seekable short-read stream initialization for both single-task and joint inference, including source lifetimes, malformed/truncated input and loader cleanup. Tiny F32 uses `atol=rtol=5e-5`; F16 storage is compared to F32 goldens with `5e-3`. **Real-checkpoint F16 parity has not been established.**
 
@@ -183,7 +242,7 @@ To include that comparison in CTest, configure `GLINER_PARITY_CHECKPOINT` and `G
 
 Parity runs use the binary's compiled backend. Both scripts accept `--expect-backend cpu|cuda|metal` to assert which build is under test; this option does not select or change the backend. CTest supplies that assertion automatically. CUDA CTest runs and standalone parity scripts explicitly set `NVIDIA_TF32_OVERRIDE=0` and `GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32` for their child processes, without changing the invoking shell. CPU/Metal runs leave those environment settings alone.
 
-Keep separate CPU/CUDA/Metal build directories and run CTest in each; a GPU build without its required device fails rather than skipping. The synthetic parity test reports backend, storage dtype, fixture, first failing encoder layer and the numerical error/allowed error. Layer 0 is embeddings. GPU tests enforce the same tolerances as CPU; hardware-specific tolerances must be measured and documented before changing them. No GPU speedup or real-checkpoint parity is claimed yet. Malformed-GGUF messages from negative loader tests are expected; a traceback or CTest failure is not.
+Keep separate CPU/CUDA/Metal build directories and run CTest in each; a GPU build without its required device fails rather than skipping. The synthetic parity test reports backend, storage dtype, fixture, first failing encoder layer and the numerical error/allowed error. Layer 0 is embeddings. GPU tests enforce the same tolerances as CPU; hardware-specific tolerances must be measured and documented before changing them. CUDA F32 parity coverage is limited to the hardware result above; Metal parity and GPU speedup measurements remain pending. Malformed-GGUF messages from negative loader tests are expected; a traceback or CTest failure is not.
 
 For classification-head-only comparisons, export contextual states with the upstream model:
 
@@ -304,6 +363,6 @@ Loading uses GGML's GGUF callback parser and at most 8 MiB tensor-transfer chunk
 
 Supported: one text with one or multiple jointly encoded classification tasks per call, ordered labels, per-task prompts and ordered label descriptions, exclusive argmax/softmax and independent multi-label thresholding, with the published Decide DeBERTa configuration.
 
-Not implemented: NER/span/JSON extraction, few-shot examples, constrained/beam/exact decision decoding, calibration fitting, automatic long-document chunking, alternate encoders/tokenizer pipelines, multi-document padded batching, quantization, memory-mapped weights, hybrid CPU/GPU offload or multi-GPU execution. CUDA/Metal hardware validation remains pending. See [NEXT_STEPS.md](NEXT_STEPS.md).
+Not implemented: NER/span/JSON extraction, few-shot examples, constrained/beam/exact decision decoding, calibration fitting, automatic long-document chunking, alternate encoders/tokenizer pipelines, multi-document padded batching, quantization, memory-mapped weights, hybrid CPU/GPU offload or multi-GPU execution. Broader CUDA hardware coverage and Metal parity remain pending. See [NEXT_STEPS.md](NEXT_STEPS.md).
 
 The model checkpoint is [Apache 2.0 licensed](https://huggingface.co/fastino/GLiNER2.5-Decide); review its license when redistributing converted weights. Checkpoints and generated GGUF files stay out of Git.
