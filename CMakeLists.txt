@@ -124,6 +124,8 @@ if(BUILD_TESTING)
     set(GLINER_PARITY_TESTS gliner-core)
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME gliner-python-benchmark-unit
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_python_benchmark.py")
         add_test(NAME gliner-cuda-precision-config
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cuda_precision_config.py"
                 "${CMAKE_COMMAND}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GgmlCudaPrecision.cmake")

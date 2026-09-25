@@ -172,7 +172,7 @@ This is one document with multiple questions, not a padded batch of multiple doc
 
 ## Performance benchmark
 
-`gliner-bench` is built alongside `gliner-classify` and uses the same synchronous C API for **CPU, CUDA and Metal**, selected at build time. It loads the model once, reads the text once and reuses execution states. CPU execution has been exercised with the real F32 checkpoint; GPU benchmark runs still need to be collected on hardware.
+`gliner-bench` is built alongside `gliner-classify` and uses the same synchronous C API for **CPU, CUDA and Metal**, selected at build time. It loads the model once, reads the text once and reuses execution states. CPU execution has been exercised with the real F32 checkpoint; the user has also supplied an RTX 4060 Laptop CUDA run for the two-question workload below.
 
 Start with a Release CPU build:
 
@@ -219,6 +219,96 @@ Timing includes tokenization, graph construction/allocation reuse, synchronized 
 Joint mode uses one state. Separate mode reuses one state per question to avoid cycling different shapes through the same allocator, while sharing the **same immutable model weights**. Modes run sequentially (`joint` then `separate` for `both`) and their states are freed between modes. The later mode may benefit from process/device caches initialized earlier; its first request is not a fresh-process cold start. For isolated measurements, use separate `--mode joint` and `--mode separate` processes and keep the machine idle. Joint and separate outputs can differ by design; their timing comparison is not a semantic-equivalence claim.
 
 The benchmark does **not** yet sample peak RAM/VRAM, measure concurrent-request serving, generate token-length sweeps or compare result files automatically. `model_file_bytes` is file size, not resident or peak memory. Use external memory monitoring and explicit input files for short/medium/long workloads. Keep CPU/GPU precision settings consistent before interpreting speedups.
+
+For the user-reported Windows workload `"Please refund my order; the delivery was late."`, tasks `intent` (`refund_request,order_status,other`) and `sentiment` (`positive,neutral,negative`), F32 weights, 4 CPU threads, 3 warmups and 20 measured requests per mode:
+
+| Mode | C++ CPU mean / p95 | C++ CUDA mean / p95 | Mean-latency speedup |
+|---|---|---|---|
+| Joint (40 tokens) | 503.62 / 510.87 ms | 35.55 / 37.23 ms | 14.17x |
+| Separate (27 + 23 tokens) | 901.80 / 986.00 ms | 54.92 / 55.60 ms | 16.42x |
+
+The RTX 4060 Laptop CUDA run used both strict precision environment settings and the MMF source fix. Model loading was 2.16 s on CPU and 4.04 s on CUDA, outside the warm timings. These are user-supplied measurements for one repeated input, not general hardware performance guarantees; the CPU model, power/thermal state and background load were not recorded with these reports.
+
+### Optional Python CPU/CUDA comparison
+
+`tests/bench_python.py` is an optional comparison helper using the existing `tests/requirements-parity.txt` environment. It reuses the upstream processor, Transformers encoder and classification head from the parity loader, once, in **float32 eval/inference mode**. The default is CPU; the Python-only `--device cuda` or `--device cuda:N` selects a CUDA GPU and fails explicitly if unavailable, without falling back to CPU. It accepts the same text, task, prompt, description, thread/limit, mode, warmup and iteration options as `gliner-bench`; supply the local Hugging Face directory with `--checkpoint` instead of a GGUF with `--model`. This does not change the C++ runtime's build-time backend selection.
+
+Run on the **same machine**, with other benchmarks/builds stopped:
+
+```powershell
+$workload = @(
+  "--text", "Please refund my order; the delivery was late.",
+  "--task", "intent", "--labels", "refund_request,order_status,other",
+  "--task", "sentiment", "--labels", "positive,neutral,negative",
+  "--threads", "4", "--mode", "both", "--warmup", "3", "--iterations", "20"
+)
+.\build-cpu\Release\gliner-bench.exe --model .\models\decide.gguf @workload `
+  > .\build-cpu\bench-cpu-comparison.json
+.\build-oracle\Scripts\python.exe .\tests\bench_python.py `
+  --checkpoint .\models\GLiNER2.5-Decide @workload `
+  > .\build-oracle\bench-python-cpu.json
+
+$cpp = Get-Content .\build-cpu\bench-cpu-comparison.json -Raw | ConvertFrom-Json
+$python = Get-Content .\build-oracle\bench-python-cpu.json -Raw | ConvertFrom-Json
+foreach ($row in $python.results) {
+  $baseline = $cpp.results | Where-Object mode -eq $row.mode
+  [pscustomobject]@{
+    Mode = $row.mode
+    CppMeanMs = $baseline.latency_ms.mean
+    PythonMeanMs = $row.latency_ms.mean
+    CppSpeedup = $row.latency_ms.mean / $baseline.latency_ms.mean
+  }
+}
+```
+
+Use a C++ result file from those exact arguments: token counts should be `[40]` for joint and `[27,23]` for separate, and each mode's `last_logits` should agree within the established F32 tolerance. `CppSpeedup` above 1 means C++ was faster. Different computers or different task/text configurations are not comparable.
+
+The Python request timer includes collation/tokenization, input transfers, encoder execution, upstream marker extraction, per-task classification and materialization of logits/sigmoid probabilities on the host. It excludes imports, model loading, initial schema construction, result validation and JSON formatting. CUDA runs synchronize the selected device before starting and before stopping each timer; warmups are also synchronized. Model weights move to the GPU once during loading, not per request. Like C++, it reports the first request separately, then runs additional warmups followed by measured samples, using the same median/p95 definition and per-request throughput formulas. Each request answers all questions; separate mode uses multiple encoder passes without reloading the model. No per-layer outputs, autocast, tracing or compilation are enabled.
+
+Python sets PyTorch intra-op threads to `--threads` and inter-op threads to 1; the JSON records the effective counts, package versions and PyTorch build configuration. Upstream's normal per-segment tokenizer cache remains active across requests and modes (C++ currently has no equivalent cache). There is no explicit Python state allocator: `state_count` is 0 and `state_init_ms` is null rather than claiming equivalence to C++ state initialization.
+
+**Compare steady-state inference, not loader timings, across implementations.** This helper loads only the upstream classification components, not unused span/counting modules or the full `AutoExtractor` facade. Safetensors can map weights lazily, whereas GGUF loading copies the required weights; imports and first-use page faults also fall in different phases. CUDA model loading includes device initialization and synchronized weight transfers. `model_load_ms` therefore does not measure equivalent full-application startup costs. Peak memory, Python Metal/MPS benchmarking, reduced-precision modes and a general cross-machine speedup claim are out of scope for this helper.
+
+For Python CUDA, first check your environment:
+
+```powershell
+.\build-oracle\Scripts\python.exe -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+```
+
+If it is CPU-only, use a separate environment to preserve the existing CPU baseline. The [official PyTorch 2.6.0 CUDA 12.6 wheel](https://pytorch.org/get-started/previous-versions/) is available for Windows/Python 3.12:
+
+```powershell
+py -3.12 -m venv build-oracle-cuda
+.\build-oracle-cuda\Scripts\python.exe -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu126
+.\build-oracle-cuda\Scripts\python.exe -m pip install -r .\tests\requirements-parity.txt
+.\build-oracle-cuda\Scripts\python.exe -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+```
+
+The wheel supplies its CUDA runtime (12.6 here); it need not match the locally installed `nvcc` toolkit used to compile GGML. The NVIDIA driver must support it. The benchmark records PyTorch's CUDA runtime, GPU name, compute capability and precision settings so that this stack difference is visible.
+
+Using the same `$workload` array from the CPU example:
+
+```powershell
+$env:NVIDIA_TF32_OVERRIDE = "0"
+$env:GGML_CUDA_CUBLAS_COMPUTE_TYPE = "f32"
+.\build-cuda\Release\gliner-bench.exe --model .\models\decide.gguf @workload `
+  > .\build-cuda\bench-cuda-comparison.json
+.\build-oracle-cuda\Scripts\python.exe .\tests\bench_python.py `
+  --checkpoint .\models\GLiNER2.5-Decide --device cuda @workload `
+  > .\build-oracle-cuda\bench-python-cuda.json
+```
+
+Use `build-oracle` instead if it already has a working CUDA-enabled PyTorch. The Python CUDA path explicitly selects PyTorch's highest F32 matmul precision and disables TF32 for matmul and cuDNN; keep the environment settings above for the C++ comparison. It does not mutate the invoking shell's environment. Compare CUDA against CUDA, including token counts and last logits, and run the programs sequentially. Python CUDA execution has not been validated on this CPU-only development host; the GPU timing/transfer policy has unit coverage and awaits a hardware run.
+
+Standard-library parser/timing tests run in CTest without ML dependencies. The optional live Python/C++ comparison can be run with:
+
+```powershell
+.\build-oracle\Scripts\python.exe .\tests\test_python_benchmark.py `
+  --cpp-bench .\build-cpu\Release\gliner-bench.exe `
+  --converter .\convert\convert_hf_to_gguf.py
+```
+
+On CUDA hardware, the same live comparison accepts `--device cuda` with the CUDA `gliner-bench` and a CUDA-enabled Python environment; it fails rather than skipping when CUDA is unavailable.
 
 ## Python parity
 

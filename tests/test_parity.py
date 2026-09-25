@@ -85,6 +85,9 @@ def load_oracle(checkpoint):
                     head[key[len("classifier."):]] = source.get_tensor(key)
     encoder.load_state_dict(weights, assign=True, strict=True)
     classifier.load_state_dict(head, assign=True, strict=True)
+    # This non-persistent buffer is absent from the checkpoint and stays on meta otherwise.
+    encoder.embeddings.register_buffer(
+        "position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)), persistent=False)
     # F16 storage is evaluated with F32 activations in GGML.
     encoder.float().eval()
     classifier.float().eval()
