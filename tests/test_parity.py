@@ -5,6 +5,7 @@ This script can regenerate those fixtures or check a real local checkpoint.
 """
 
 import argparse
+from dataclasses import replace
 import json
 import math
 import struct
@@ -115,6 +116,33 @@ RECORD_CASES = [
      "threshold": 1., "synthetic_count": 3},
 ]
 
+BOUNDARY_CASES = SPAN_CASES + [
+    {"text": " ".join(["alpha", "beta", "gamma", "delta"] * 36), "labels": ["phrase", "term"],
+     "threshold": 0., "top_k": 4, "allow_overlap": True},
+    {"text": "Élodie travaille chez Airbus à Paris.", "labels": ["person", "company", "location"]},
+    {"text": "张伟在北京的微软工作。", "labels": ["person", "company", "location"]},
+    {"text": "تعمل ليلى لدى مايكروسوفت في دبي.", "labels": ["person", "company", "location"]},
+    {"text": "María trabaja para Telefónica en Madrid.", "labels": ["person", "company", "location"]},
+]
+
+BOUNDARY_RECORD_CASES = [
+    {"text": "Alice works at Contoso. Bob works at Fabrikam.", "structure": "employment",
+     "fields": [{"name": "person", "type": "single", "description": "Employee name"},
+                {"name": "company", "type": "single", "description": "Employer name"}]},
+    {"text": "Check Cloudflare D1 parameter limits and Email Sending recipient limits.", "structure": "search_requests",
+     "fields": [{"name": "terms", "type": "list", "description": "Verbatim search terms for one request needing additional context"}],
+     "threshold": 0.3, "top_k": 5},
+    {"text": "", "structure": "requests", "fields": [{"name": "terms", "type": "list"}]},
+    {"text": "Élodie travaille chez Airbus à Paris.", "structure": "employment",
+     "fields": [{"name": "person", "type": "single"}, {"name": "location", "type": "list"}], "threshold": 0.1},
+    {"text": "Alice works at Contoso. Bob works at Fabrikam.", "structure": "requests",
+     "fields": [{"name": "terms", "type": "list"}], "max_words": 3, "threshold": 0., "top_k": 2},
+    {"text": "Cloudflare D1 parameter limit", "structure": "requests",
+     "fields": [{"name": "terms", "type": "list"}], "threshold": 0., "top_k": 3, "allow_overlap": True},
+    {"text": "alpha alpha beta alpha beta.", "structure": "requests",
+     "fields": [{"name": "terms", "type": "list"}], "threshold": 1.},
+]
+
 
 def load_oracle(checkpoint):
     config = DebertaV2Config.from_pretrained(checkpoint / "encoder_config")
@@ -180,6 +208,192 @@ def load_span_oracle(checkpoint):
         module.float().eval()
     return processor, encoder, span, count_embed, count_pred, width
 
+
+def load_boundary_oracle(checkpoint, records=False):
+    from gliner2.models.boundary.encoding import BoundaryEncoder
+    from gliner2.models.boundary.heads import BoundaryQueryHead
+    from gliner2.models.boundary.pool import DocumentCandidatePool, SharedPoolScorer
+    processor, encoder, _ = load_oracle(checkpoint)
+    config = json.loads((checkpoint / "config.json").read_text(encoding="utf8"))["boundary_head"]
+    if config["candidate_pool"] != "shared":
+        raise ValueError("Reference expects the shared boundary pool")
+    h, d = encoder.config.hidden_size, config["boundary_dim"]
+    with torch.device("meta"):
+        modules = {
+            "boundary_encoder": BoundaryEncoder(h, d, config["dropout"], config["boundary_refinement_layers"],
+                config["boundary_ffn_multiplier"], config["boundary_attention_layers"], config["boundary_attention_heads"],
+                config["boundary_attention_window"]),
+            "boundary_query_head": BoundaryQueryHead(h, d, h, config["dropout"]),
+            "shared_pool_builder": DocumentCandidatePool(d, pool_boundary_top_k=config["pool_boundary_top_k"],
+                pool_size=config["pool_size"], min_pool_per_query=config["min_pool_per_query"]),
+            "shared_pool_scorer": SharedPoolScorer(d, h, config["pair_dim"], dropout=config["dropout"],
+                candidate_attention_layers=config["candidate_attention_layers"],
+                candidate_attention_heads=config["candidate_attention_heads"], query_attention_layers=config["query_attention_layers"],
+                enable_span_content=config["enable_span_content"], content_dim=config["content_dim"],
+                content_soft_max_pool=config["content_soft_max_pool"], text_hidden_size=h),
+            "null_projection": torch.nn.Linear(h, 1),
+        }
+        if records:
+            from gliner2.models.boundary.records import RecordHead
+            modules["candidate_encoder"] = torch.nn.Linear(2 * d, h)
+            modules["record_decoder"] = RecordHead(h, config["record_dim"], config["record_instance_queries"])
+    weights = {key: {} for key in modules}
+    index = checkpoint / "model.safetensors.index.json"
+    shards = sorted(set(json.loads(index.read_text())["weight_map"].values())) if index.exists() else ["model.safetensors"]
+    for shard in shards:
+        with safe_open(checkpoint / shard, framework="pt") as source:
+            for key in source.keys():
+                if records and key.startswith("record_decoder."):
+                    weights["record_decoder"][key[len("record_decoder."):]] = source.get_tensor(key)
+                if not key.startswith("boundary_head."):
+                    continue
+                module, _, name = key[len("boundary_head."):].partition(".")
+                if module in weights:
+                    weights[module][name] = source.get_tensor(key)
+    for key, module in modules.items():
+        module.load_state_dict(weights[key], strict=True, assign=True)
+        module.float().eval()
+    return processor, encoder, modules, config
+
+
+def boundary_reference(oracle, case, dense=False):
+    from gliner2.inference.overlap import resolve_overlaps
+    processor, encoder, modules, config = oracle
+    records = "fields" in case
+    labels = [f["name"] for f in case["fields"]] if records else case["labels"]
+    if records:
+        name, fields = case["structure"], case["fields"]
+        schema = {"json_structures": [{name: {field["name"]: [] for field in fields}}],
+                  "json_descriptions": {name: {field["name"]: field["description"] for field in fields if "description" in field}},
+                  "record_metadata": {name: {"mode": case["record_mode"]}}}
+    else:
+        schema = {"entities": {label: [] for label in labels},
+                  "entity_descriptions": dict(zip(labels, case.get("descriptions", [])))}
+    batch = processor.collate_fn_inference([(case["text"], schema)], max_len=case.get("max_words"), error_policy="raise")
+    with torch.inference_mode():
+        encoded = encoder(input_ids=batch.input_ids, attention_mask=batch.attention_mask).last_hidden_state
+        words, groups = processor.extract_embeddings_from_batch(encoded, batch.input_ids, batch)
+        text_states = words[0].unsqueeze(0)
+        queries = torch.stack(groups[0][0][1:]).unsqueeze(0)
+        text_mask = torch.ones(text_states.shape[:2], dtype=torch.bool)
+        query_mask = torch.ones(queries.shape[:2], dtype=torch.bool)
+        encoding = modules["boundary_encoder"](text_states, text_mask)
+        marginals = modules["boundary_query_head"](encoding.states, encoding.mask, text_states, text_mask, queries, query_mask)
+        pool = modules["shared_pool_builder"](encoding.states, encoding.mask, query_mask, marginals.start_logits, marginals.end_logits)
+        all_logits, _ = modules["shared_pool_scorer"](encoding.states, queries, query_mask, pool, marginals.start_logits,
+            marginals.end_logits, marginals.inside_prefix, text_mask.sum(-1), text_states, text_mask, marginals.inside_prefix_mean)
+        indices = pool.indices[0, pool.mask[0]]
+        logits = all_logits[0, pool.mask[0]].T
+        null_logits = modules["null_projection"](queries)[0, :, 0]
+        probabilities = (logits / config["pair_temperature"]).sigmoid()
+        if records:
+            states = modules["candidate_encoder"](torch.cat(
+                (encoding.states[:, pool.indices[0, :, 0]], encoding.states[:, pool.indices[0, :, 1]]), -1))
+            candidates = pool.to_candidate_batch(all_logits, query_mask, states)
+            return boundary_record_reference(oracle, case, batch, words, queries, candidates, indices, logits)
+        dense_scores = {}
+        if dense:
+            # F16 execution can change the discrete pool; retain references for every valid pair.
+            pairs = torch.triu_indices(encoding.states.shape[1], encoding.states.shape[1], offset=1).T
+            builder = modules["shared_pool_builder"]
+            starts = builder.start_projection(encoding.states)[:, pairs[:, 0]]
+            ends = builder.end_projection(encoding.states)[:, pairs[:, 1]]
+            compat = (starts * ends).sum(-1) / math.sqrt(starts.shape[-1])
+            proposals = compat + marginals.start_logits.max(1).values[:, pairs[:, 0]] + marginals.end_logits.max(1).values[:, pairs[:, 1]]
+            universe = replace(pool, indices=pairs.unsqueeze(0), mask=torch.ones((1, len(pairs)), dtype=torch.bool),
+                               proposal_logits=proposals, compat_logits=compat, gold_mask=None, stats=None)
+            scores, _ = modules["shared_pool_scorer"](encoding.states, queries, query_mask, universe,
+                marginals.start_logits, marginals.end_logits, marginals.inside_prefix, text_mask.sum(-1),
+                text_states, text_mask, marginals.inside_prefix_mean)
+            dense_scores = {"all_start_words": pairs[:, 0].tolist(), "all_end_words": pairs[:, 1].tolist(),
+                            "all_span_logits": scores[0].T.flatten().tolist(), "all_proposal_logits": proposals[0].tolist()}
+    results = []
+    text = case["text"]
+    for label, name in enumerate(labels):
+        candidates = []
+        if float(null_logits[label].sigmoid()) <= config["abstention_threshold"]:
+            for i, (s, e) in enumerate(indices.tolist()):
+                first, last_start = batch.start_mappings[0][s], batch.start_mappings[0][e - 1]
+                end = min(len(text), batch.end_mappings[0][e - 1])
+                if first >= len(text) or last_start >= len(text) or probabilities[label, i] < case.get("threshold", 0.5):
+                    continue
+                candidates.append({"text": text[first:end], "start": len(text[:first].encode("utf8")),
+                    "end": len(text[:end].encode("utf8")), "probability": float(probabilities[label, i]), "logit": float(logits[label, i])})
+        selected = resolve_overlaps(candidates, "allow" if case.get("allow_overlap") else "flat",
+            score=lambda c: c["probability"], start=lambda c: c["start"], end=lambda c: c["end"])
+        if case.get("top_k", 0):
+            selected = selected[:case["top_k"]]
+        results.append({"label": name, "spans": selected})
+    return {"case": case, "groups": results, "input_ids": batch.input_ids[0].tolist(),
+        "label_positions": batch.schema_special_indices[0][0][1:],
+        "word_positions": batch.text_word_indices[0, :len(words[0])].tolist(),
+        "start_words": indices[:, 0].tolist(), "end_words": indices[:, 1].tolist(), "max_span_width": None,
+        "span_logits": logits.flatten().tolist(), "null_logits": null_logits.tolist(),
+        "start_logits": marginals.start_logits.flatten().tolist(), "end_logits": marginals.end_logits.flatten().tolist(),
+        "proposal_logits": pool.proposal_logits[0, pool.mask[0]].tolist(), "pool_capacity": config["pool_size"],
+        "pair_temperature": config["pair_temperature"], "abstention_threshold": config["abstention_threshold"], **dense_scores}
+
+def boundary_record_reference(oracle, case, batch, words, queries, candidates, indices, pair_logits):
+    from gliner2.models.boundary.records import decode_group
+    from gliner2.processing.records import RecordSpec, RecordFieldSpec, FieldCardinality
+    from gliner2.inference.candidate_decoder import finalize_spans
+    _, _, modules, config = oracle
+    fields = case["fields"]
+    spec = RecordSpec(0, case["structure"], "json_structures", case["record_mode"], tuple(
+        RecordFieldSpec(i, f["name"], i, FieldCardinality.OPTIONAL_ONE if f["type"] == "single" else FieldCardinality.ZERO_OR_MORE)
+        for i, f in enumerate(fields)))
+    group = modules["record_decoder"].forward_group(spec, queries[0], candidates, 0)
+    threshold = case.get("threshold", 0.5)
+    settings = dict(anchor_threshold=threshold, object_threshold=threshold, field_threshold=threshold,
+                    temperature=config["record_temperature"])
+    decoded = decode_group(group, **settings)
+    # Recover the original instance slot without replacing upstream's selection/dedup logic.
+    def signature(rec):
+        return rec.score, tuple((k, tuple(v)) for k, v in sorted(rec.fields.items()))
+    slots = {}
+    object_probabilities = (group.object_logits / config["record_temperature"]).sigmoid()
+    for slot in range(group.num_instances):
+        single = replace(group, object_logits=group.object_logits[slot:slot + 1],
+            assign_logits=[v[slot:slot + 1] for v in group.assign_logits],
+            instance_seed=group.instance_seed[slot:slot + 1], instance_spans=group.instance_spans[slot:slot + 1])
+        for rec in decode_group(single, **settings):
+            rec.score = float(object_probabilities[slot])
+            slots.setdefault(signature(rec), slot)
+    pair_lookup = {tuple(span): i for i, span in enumerate(indices.tolist())}
+    result = []
+    text = case["text"]
+    pair_probs = (pair_logits / config["pair_temperature"]).sigmoid()
+    for rec in decoded:
+        slot = slots[signature(rec)]
+        values = {}
+        for f, field in enumerate(fields):
+            raw, by_offset = [], {}
+            for (s, e), assignment in zip(rec.fields.get(f, []), rec.field_scores.get(f, [])):
+                first, last = batch.start_mappings[0][s], batch.start_mappings[0][e - 1]
+                end = min(len(text), batch.end_mappings[0][e - 1])
+                c = pair_lookup[s, e]
+                if first >= len(text) or last >= len(text) or pair_probs[f, c] < threshold:
+                    continue
+                start_byte, end_byte = len(text[:first].encode("utf8")), len(text[:end].encode("utf8"))
+                probability = min(float(pair_probs[f, c]), assignment)
+                raw.append((text[first:end], probability, start_byte, end_byte))
+                by_offset[start_byte, end_byte] = float(group.assign_logits[f][slot, c + 1])
+            selected = finalize_spans(raw, dtype="str" if field["type"] == "single" else "list",
+                                      overlap_policy="allow" if case.get("allow_overlap") else "flat")
+            if field["type"] != "single" and case.get("top_k", 0):
+                selected = selected[:case["top_k"]]
+            formatted = [{"text": t, "probability": p, "start": s, "end": e, "logit": by_offset[s, e]} for t, p, s, e in selected]
+            values[field["name"]] = formatted if field["type"] != "single" else formatted[0] if formatted else None
+        if any(value is not None and value != [] for value in values.values()):
+            result.append({"slot_index": slot % len(indices) if case["record_mode"] == "latent" else slot, "fields": values})
+    return {"case": case, "structure": case["structure"], "record_mode": case["record_mode"],
+        "record_count": len(result), "records": result, "max_span_width": None,
+        "n_instances": group.num_instances, "record_temperature": config["record_temperature"],
+        "input_ids": batch.input_ids[0].tolist(), "field_positions": batch.schema_special_indices[0][0][1:],
+        "word_positions": batch.text_word_indices[0, :len(words[0])].tolist(),
+        "start_words": indices[:, 0].tolist(), "end_words": indices[:, 1].tolist(), "pair_logits": pair_logits.flatten().tolist(),
+        "object_logits": group.object_logits.tolist(),
+        "assignment_logits": torch.stack(group.assign_logits).flatten().tolist()}
 
 def span_forward(oracle, case, schema):
     processor, encoder, span, count_embed, count_pred, width = oracle
@@ -299,9 +513,12 @@ def compare_spans(binary, model, expected, tolerance, backend):
         command += ["--allow-overlap"]
     actual = json.loads(subprocess.check_output(command, encoding="utf8"))
     assert actual["backend"] == backend and actual["offset_unit"] == "utf8_bytes"
-    for key in ("input_ids", "label_positions", "word_positions", "start_words", "end_words", "predicted_count", "max_span_width"):
+    boundary = "pool_capacity" in expected
+    exact = ("pool_capacity",) if boundary else ("predicted_count",)
+    for key in ("input_ids", "label_positions", "word_positions", "start_words", "end_words", "max_span_width", *exact):
         assert actual[key] == expected[key], key
-    for key in ("span_logits", "count_logits"):
+    numerical = ("null_logits", "start_logits", "end_logits", "proposal_logits") if boundary else ("count_logits",)
+    for key in ("span_logits", *numerical):
         np.testing.assert_allclose(actual[key], expected[key], atol=tolerance, rtol=tolerance, err_msg=key)
     assert len(actual["groups"]) == len(expected["groups"])
     for group, reference in zip(actual["groups"], expected["groups"]):
@@ -311,7 +528,7 @@ def compare_spans(binary, model, expected, tolerance, backend):
         for value, ref in zip(group["spans"], reference["spans"]):
             np.testing.assert_allclose([value["logit"], value["probability"]], [ref["logit"], ref["probability"]],
                                        atol=tolerance, rtol=tolerance)
-    error = max(abs(a - b) for a, b in zip(actual["span_logits"], expected["span_logits"]))
+    error = max((abs(a - b) for a, b in zip(actual["span_logits"], expected["span_logits"])), default=0)
     print(f"PASS spans {backend}: {len(actual['input_ids'])} tokens; {len(expected['span_logits'])} raw logits; max error {error:.8g}")
 
 def compare_records(binary, model, expected, tolerance, backend):
@@ -327,11 +544,15 @@ def compare_records(binary, model, expected, tolerance, backend):
             args += [option, str(case[name])]
     if case.get("allow_overlap"):
         args += ["--allow-overlap"]
+    boundary = "record_mode" in case
+    if boundary:
+        args += ["--record-mode", case["record_mode"], "--max-records", "4096"]
     actual = json.loads(subprocess.check_output(args, encoding="utf8"))
     assert actual["backend"] == backend and actual["offset_unit"] == "utf8_bytes"
-    for key in ("structure", "input_ids", "field_positions", "word_positions", "start_words", "end_words", "predicted_count", "max_span_width"):
+    exact = ("record_mode", "record_count", "n_instances") if boundary else ("predicted_count",)
+    for key in ("structure", "input_ids", "field_positions", "word_positions", "start_words", "end_words", "max_span_width", *exact):
         assert actual[key] == expected[key], key
-    for key in ("count_logits", "record_logits"):
+    for key in (("pair_logits", "object_logits", "assignment_logits") if boundary else ("count_logits", "record_logits")):
         np.testing.assert_allclose(actual[key], expected[key], atol=tolerance, rtol=tolerance, err_msg=key)
     assert len(actual["records"]) == len(expected["records"]), (actual["records"], expected["records"])
     for record, ref in zip(actual["records"], expected["records"]):
@@ -344,8 +565,9 @@ def compare_records(binary, model, expected, tolerance, backend):
             for v, r in zip(value, reference):
                 np.testing.assert_allclose([v["logit"], v["probability"]], [r["logit"], r["probability"]],
                                            atol=tolerance, rtol=tolerance)
-    error = max((abs(a - b) for a, b in zip(actual["record_logits"], expected["record_logits"])), default=0)
-    print(f"PASS records {backend}: {len(actual['input_ids'])} tokens; {actual['predicted_count']} slots; "
+    key = "assignment_logits" if boundary else "record_logits"
+    error = max((abs(a - b) for a, b in zip(actual[key], expected[key])), default=0)
+    print(f"PASS records {backend}: {len(actual['input_ids'])} tokens; {actual.get('n_instances', actual.get('predicted_count'))} slots; "
           f"{len(actual['records'])} nonempty records; max logit error {error:.8g}")
 
 
@@ -470,6 +692,10 @@ def main():
     group.add_argument("--spans-only", action="store_true", help="Generate/test grouped entity span extraction using gliner-extract")
     group.add_argument("--records-only", action="store_true", help="Generate/test count-conditioned records using gliner-extract")
     group.add_argument("--multilingual-only", action="store_true", help="Compare French, Chinese, Arabic and Spanish classification inputs")
+    group.add_argument("--boundary-spans-only", action="store_true", help="Generate/test shared-pool boundary entity extraction")
+    group.add_argument("--boundary-records-only", action="store_true", help="Generate/test anchorless and latent boundary records")
+    parser.add_argument("--synthetic-dtype", choices=("F32", "F16"), default="F32",
+                        help="Stored tensor dtype when generating a synthetic checkpoint")
     parser.add_argument("--case", type=int, action="append")
     parser.add_argument("--tolerance", type=float, default=3e-4)
     args = parser.parse_args()
@@ -492,11 +718,17 @@ def main():
             checkpoint = directory
             create_checkpoint(checkpoint, hidden=32 if args.kernel_only else 8, layers=2,
                               compact_tokens=args.kernel_only, spans=args.spans_only or args.records_only,
-                              records=args.records_only)
-        oracle = load_span_oracle(checkpoint) if args.spans_only or args.records_only else load_oracle(checkpoint)
-        cases = (MULTILINGUAL_CASES if args.multilingual_only else RECORD_CASES if args.records_only else
+                              records=args.records_only or args.boundary_records_only,
+                              boundary=args.boundary_spans_only or args.boundary_records_only, dtype=args.synthetic_dtype)
+        oracle = load_boundary_oracle(checkpoint, records=args.boundary_records_only) if args.boundary_spans_only or args.boundary_records_only else load_span_oracle(checkpoint) if args.spans_only or args.records_only else load_oracle(checkpoint)
+        cases = (BOUNDARY_CASES if args.boundary_spans_only else MULTILINGUAL_CASES if args.multilingual_only else RECORD_CASES if args.records_only else
                  SPAN_CASES if args.spans_only else KERNEL_CASES if args.kernel_only else
                  BATCH_CASES if args.batch_only else CASES if args.single_only else CASES + BATCH_CASES)
+        if args.boundary_records_only:
+            cases = BOUNDARY_RECORD_CASES[:]
+            if args.checkpoint:
+                cases.append({**BOUNDARY_RECORD_CASES[1], "text": SPAN_CASES[5]["text"]})
+            cases = [{**case, "record_mode": mode} for case in cases for mode in ("anchorless", "latent")]
         selected = cases if args.case is None else [cases[i] for i in args.case]
         fixtures = []
         for case in selected:
@@ -504,12 +736,12 @@ def main():
                 with torch.no_grad():
                     oracle[4][2].bias.zero_()
                     oracle[4][2].bias[case["synthetic_count"]] = 1.
-            expected = record_reference(oracle, case) if args.records_only else span_reference(oracle, case) if args.spans_only else reference(oracle, case)
+            expected = boundary_reference(oracle, case, dense=args.synthetic_dtype == "F16" and args.checkpoint is None) if args.boundary_spans_only or args.boundary_records_only else record_reference(oracle, case) if args.records_only else span_reference(oracle, case) if args.spans_only else reference(oracle, case)
             fixtures.append(expected)
             if args.binary and args.gguf:
-                if args.records_only:
+                if args.records_only or args.boundary_records_only:
                     compare_records(args.binary, args.gguf, expected, args.tolerance, backend)
-                elif args.spans_only:
+                elif args.spans_only or args.boundary_spans_only:
                     compare_spans(args.binary, args.gguf, expected, args.tolerance, backend)
                 else:
                     compare(args.binary, args.gguf, expected, args.tolerance, directory, backend)
@@ -524,7 +756,10 @@ def main():
                                                                       "--kernel-only " if args.kernel_only else
                                                                       "--spans-only " if args.spans_only else
                                                                       "--records-only " if args.records_only else
-                                                                      "--multilingual-only " if args.multilingual_only else "") + "--write-golden"},
+                                                                      "--boundary-records-only " if args.boundary_records_only else
+                                                                      "--multilingual-only " if args.multilingual_only else
+                                                                      "--boundary-spans-only " if args.boundary_spans_only else "") +
+                                                    f"--synthetic-dtype {args.synthetic_dtype} --write-golden"},
                 "fixtures": fixtures}, separators=(",", ":")), encoding="utf8")
 
 

@@ -79,14 +79,14 @@ struct gliner_span_params {
     int max_words; // 0 means no word truncation
     float threshold; // sigmoid probability cutoff, inclusive, 0..1
     int max_spans_per_label; // 0 means unlimited; applied after overlap suppression
-    int allow_overlap; // 0: confidence-first greedy nonoverlap per label; 1: allow
+    int allow_overlap; // 0: architecture default (span greedy / boundary weighted flat); 1: allow
 };
 
 struct gliner_span {
     int label_index;
     size_t start; // UTF-8 byte offsets into caller text, half-open [start, end)
     size_t end;
-    float logit;
+    float logit; // boundary records: unscaled field-assignment logit, not the final probability's inverse
     float probability;
     const char * text; // exact source substring, owned by state
 };
@@ -110,6 +110,27 @@ struct gliner_span_scores {
 
 struct gliner_span_params gliner_default_span_params(void);
 
+// Boundary shared-pool diagnostics; valid only after successful boundary extraction.
+// Candidate coordinates are half-open word boundaries; logits are [n_labels,n_candidates].
+// Marginal arrays are [n_labels,n_words+1]. There is no fixed span-width axis.
+struct gliner_boundary_scores {
+    int n_labels;
+    int n_words;
+    int n_candidates;
+    int pool_capacity;
+    float pair_temperature;
+    float abstention_threshold;
+    const int32_t * label_positions;
+    const int32_t * word_positions;
+    const int32_t * start_words;
+    const int32_t * end_words;
+    const float * logits;
+    const float * proposal_logits;
+    const float * start_logits;
+    const float * end_logits;
+    const float * null_logits; // n_labels; sigmoid above threshold suppresses that label
+};
+
 enum gliner_field_type {
     GLINER_FIELD_LIST = 0,
     GLINER_FIELD_SINGLE = 1,
@@ -121,18 +142,25 @@ struct gliner_record_field {
     enum gliner_field_type type;
 };
 
+enum gliner_record_mode {
+    GLINER_RECORD_AUTO = 0, // span: count-conditioned; boundary: anchorless
+    GLINER_RECORD_ANCHORLESS = 1,
+    GLINER_RECORD_LATENT = 2,
+};
+
 struct gliner_record_params {
     int n_threads;
     int max_tokens;
     int max_words;
     float threshold;
-    int max_records; // safety limit, 1..19; exceeding it is an error, not truncation
+    int max_records; // safety limit; span 1..19, boundary 1..4096; default 19
     int max_spans_per_field; // list fields: 0 means all, after overlap suppression
     int allow_overlap; // 0 or 1, applied within each field and record
+    enum gliner_record_mode mode; // explicit modes require a boundary record head
 };
 
 struct gliner_record {
-    int slot_index; // original predicted slot; all-empty records are omitted
+    int slot_index; // original count/query slot, or canonical pool index for boundary latent mode
     int span_offset; // range in gliner_get_record_spans()
     int n_spans;
 };
@@ -151,6 +179,27 @@ struct gliner_record_scores {
     const int32_t * end_words;
     const float * logits;
     const float * count_logits; // 20 classes, counts 0..19
+};
+
+// Boundary records have no count head. Latent raw instances repeat the shared pool
+// once per field; returned slot_index canonicalizes these equivalent seeds to a pool index.
+// Assignments are [n_fields,n_instances,n_candidates+1]; column 0 is ABSENT.
+// Pair logits are [n_fields,n_candidates]. Single fields use assignment softmax,
+// lists use sigmoid; returned confidence is min(pair probability, assignment probability).
+struct gliner_boundary_record_scores {
+    int n_fields;
+    int n_words;
+    int n_candidates;
+    int n_instances;
+    enum gliner_record_mode mode;
+    float temperature;
+    const int32_t * field_positions;
+    const int32_t * word_positions;
+    const int32_t * start_words;
+    const int32_t * end_words;
+    const float * pair_logits;
+    const float * object_logits;
+    const float * assignment_logits;
 };
 
 struct gliner_record_params gliner_default_record_params(void);
@@ -183,8 +232,9 @@ int gliner_model_n_tensors(const struct gliner_context * ctx);
 int gliner_model_n_layers(const struct gliner_context * ctx);
 int gliner_model_supports_text(const struct gliner_context * ctx);
 int gliner_model_supports_spans(const struct gliner_context * ctx);
+int gliner_model_supports_records(const struct gliner_context * ctx);
 // Serialized architecture, "span" or "boundary"; NULL context returns NULL.
-// Boundary support currently covers classification only, not spans or records.
+// Extraction capabilities are queried separately.
 const char * gliner_model_architecture(const struct gliner_context * ctx);
 // Fixed by GGML_CUDA/GGML_METAL at build time, not by an initialization parameter.
 // Returns "cpu", "cuda" or "metal" without initializing any devices.
@@ -240,7 +290,7 @@ const struct gliner_task_result * gliner_get_task_results(const struct gliner_st
 // Grouped, verbatim entity/keyphrase extraction in one encoder pass, using upstream
 // entity schema semantics. Scores do not guarantee retrieval usefulness. Pointers are
 // borrowed only for this call; all inference results clear on failure or the next call.
-// Requires a checkpoint converted with span metadata. params may be NULL for defaults.
+// Requires supported span or shared-pool boundary metadata. params may be NULL for defaults.
 int gliner_extract_spans(
     const struct gliner_context * ctx,
     struct gliner_state * state,
@@ -254,12 +304,14 @@ int gliner_extract_spans(
 int gliner_n_spans(const struct gliner_state * state);
 const struct gliner_span * gliner_get_spans(const struct gliner_state * state);
 const struct gliner_span_scores * gliner_get_span_scores(const struct gliner_state * state);
+const struct gliner_boundary_scores * gliner_get_boundary_scores(const struct gliner_state * state);
 
 // Extract repeated records of one structure, without caller-supplied topic groups.
 // All fields must have unique nonempty names; list fields select multiple spans,
 // single fields select the best surviving span. Missing fields have no span entries.
-// One encoder pass predicts the count; a second head-only graph conditions each slot.
-// Requires the same markerV0/count_lstm metadata as gliner_extract_spans.
+// One encoder pass, followed by architecture-specific head graphs. Span checkpoints
+// predict a count; boundary checkpoints select instances and assign fields with ABSENT.
+// Requires markerV0/count_lstm or supported boundary record metadata.
 int gliner_extract_records(
     const struct gliner_context * ctx,
     struct gliner_state * state,
@@ -276,11 +328,12 @@ int gliner_n_records(const struct gliner_state * state);
 const struct gliner_record * gliner_get_records(const struct gliner_state * state);
 const struct gliner_span * gliner_get_record_spans(const struct gliner_state * state);
 const struct gliner_record_scores * gliner_get_record_scores(const struct gliner_state * state);
+const struct gliner_boundary_record_scores * gliner_get_boundary_record_scores(const struct gliner_state * state);
 
 // Token IDs from the last successful classification/extraction (empty after states-only or failure).
 int gliner_n_tokens(const struct gliner_state * state);
 const int32_t * gliner_get_token_ids(const struct gliner_state * state);
-// Classification-only label diagnostics; extraction uses gliner_get_span_scores instead.
+// Classification-only label diagnostics; extraction has architecture-specific score getters.
 const int32_t * gliner_get_label_positions(const struct gliner_state * state); // n_scores entries
 const float * gliner_get_label_states(const struct gliner_state * state); // n_scores * hidden_size
 

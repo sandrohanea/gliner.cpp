@@ -4,7 +4,7 @@ GGML/GGUF inference for [fastino/GLiNER2.5-Decide](https://huggingface.co/fastin
 
 Despite its name, the published checkpoint uses the **span** architecture. Its classification head is `Linear(H, 2H)`, ReLU, `Linear(2H, 1)` on contextual marker states, not standalone label embeddings.
 
-**Additional GLiNER2.5 models:** base, small, multilingual and multilingual Decide checkpoints now support native classification. All four use the **boundary** architecture; their span/record heads are not implemented yet. See [Model compatibility](docs/models.md) for exact revisions, the feature matrix and CPU parity results.
+**Additional GLiNER2.5 models:** base, small, multilingual and multilingual Decide checkpoints support native classification, grouped entity spans and repeated records. All four use the **boundary** architecture with a shared candidate pool and an instance/field-assignment record head. See [Model compatibility](docs/models.md) for exact revisions, supported modes and CPU parity results.
 
 **No Python is needed to build or run the C++ library, CLI or benchmark from a GGUF model.** Python is limited to one-time Hugging Face conversion and optional developer tests/reference checks.
 
@@ -117,7 +117,7 @@ build/gliner-classify --model models/decide.gguf --inspect
 
 Conversion has no Python package dependencies. Once converted, distribute/use the GGUF with the native runtime; no checkpoint directory or Python environment is needed for inference. Checkpoints and GGUF outputs are ignored by Git.
 
-The converter is streaming and **standard-library-only**. It preserves every F32/F16 tensor without quantization. It validates tensor shapes, dtypes, offsets, shard indexes, required encoder/classifier tensors and the supported tokenizer/encoder configuration. Checkpoints declaring a `markerV0` span head also require complete span, count-gate and `count_lstm` conditioning tensors. The GGUF v3 container uses application format 2 for span checkpoints and format 3 for boundary classification. Format 3 also records reversible aliases for boundary tensor names exceeding GGML's name-length limit; no tensor data is removed. See [format details](docs/models.md#gguf-application-format).
+The converter is streaming and **standard-library-only**. It preserves every F32/F16 tensor without quantization. It validates tensor shapes, dtypes, offsets, shard indexes, required encoder/classifier tensors and the supported tokenizer/encoder configuration. Checkpoints declaring a `markerV0` span head also require complete span, count-gate and `count_lstm` conditioning tensors; supported boundary checkpoints require their refinement, marginal, pool, content, pair-scoring and abstention tensors. With `enable_records`, candidate-encoder and instance/assignment tensors are required too. The GGUF v3 container uses application format 2 for span checkpoints and format 3 for boundary checkpoints. Format 3 also records reversible aliases for boundary tensor names exceeding GGML's name-length limit; no tensor data is removed. `--classification-only` deliberately enables only classification while still preserving every tensor. See [format details](docs/models.md#gguf-application-format).
 
 Older GGUF files remain usable with `--states`, but must be **reconverted** for text inference. Incomplete or unsupported version-2 models fail at load time rather than returning plausible scores.
 
@@ -191,7 +191,7 @@ This is one document with multiple questions, not a padded batch of multiple doc
 
 ## Grouped span extraction
 
-`gliner-extract` returns **verbatim substrings**, their half-open **UTF-8 byte offsets**, raw logits and sigmoid confidence, grouped by supplied extraction labels. All labels share one encoder pass and one loaded model. It follows upstream entity-schema scoring: contextual `[E]` markers, `markerV0` endpoint/output MLPs, the count gate and the first count-conditioned GRU/projector step. It is not the classification head applied to arbitrary words.
+`gliner-extract` returns **verbatim substrings**, their half-open **UTF-8 byte offsets**, raw logits and sigmoid confidence, grouped by supplied extraction labels. All labels share one encoder pass and one loaded model. For English Decide it follows upstream contextual `[E]` markers, `markerV0` endpoint/output MLPs, the count gate and the first count-conditioned GRU/projector step. Boundary models instead use refined word-boundary states, a shared candidate pool, content/FiLM pair scoring, inside evidence and per-label abstention. Neither path applies the classification head to arbitrary words.
 
 Reconvert an existing checkpoint with the updated converter to include the required span metadata:
 
@@ -208,6 +208,18 @@ python .\convert\convert_hf_to_gguf.py .\models\GLiNER2.5-Decide .\models\decide
 ```
 
 This example matches upstream's `Tim Cook`, `Apple` and `California` spans. The output has a `groups` array in label order; each group contains `label` and `spans`, whose entries contain `text`, `start`, `end`, `logit` and `probability`. Empty groups remain present. `span_extraction: yes` in `--inspect` confirms model support. Older GGUF files still classify but cannot extract until reconverted, even if their span tensors were preserved.
+
+For the boundary family, use the same CLI with a freshly converted model:
+
+```powershell
+python .\convert\convert_hf_to_gguf.py .\models\gliner2.5-small-v1 .\models\gliner2.5-small-spans.gguf
+.\build\Release\gliner-extract.exe --model .\models\gliner2.5-small-spans.gguf `
+  --text "Tim Cook works at Apple in California." --labels person,company,location `
+  --description "person=A person name" --description "company=A company name" `
+  --description "location=A location name" --threads 4
+```
+
+The small checkpoint returns the same three entity texts here. Base and both multilingual checkpoints use the same supported shared-pool path. Boundary output sets `max_span_width` to `null`: spans are bounded by the text/token budget and learned candidate pool, not Decide's eight-word width. Default overlap handling maximizes total confidence over non-overlapping spans; `--allow-overlap` keeps all surviving candidates. Boundary models may abstain independently for each label, even at a zero extraction threshold.
 
 To request both search-term groups from one input:
 
@@ -229,17 +241,19 @@ To request both search-term groups from one input:
 | `--description NAME=TEXT` | Optional per-label guidance, encoded in label order. |
 | `--threshold P` | Inclusive sigmoid cutoff in `[0,1]`, default 0.5. Confidence is not a calibrated retrieval-relevance score. |
 | `--top-k N` | Maximum returned spans per label **after** overlap suppression; 0 means all, the default. |
-| `--allow-overlap` | Disable confidence-first greedy overlap suppression within each label. Different labels may overlap regardless. |
+| `--allow-overlap` | Disable per-label overlap suppression: greedy for span checkpoints, weighted flat selection for boundary checkpoints. Different labels may overlap regardless. |
 | `--max-tokens N` / `--max-words N` | Same aggregate token budget and explicit text-word truncation as classification. No silent truncation. |
-| `--debug` | Token IDs, label/word positions, candidate word ranges, all raw span/count logits and the predicted count. |
+| `--debug` | Token IDs, label/word positions, candidate ranges and raw logits. Span checkpoints add count logits/count; boundary checkpoints add start/end marginals, proposal/null logits, pool capacity and temperature/abstention settings. |
 
-Results are ordered by label, then descending confidence with source-position tie breaking. A predicted count of zero suppresses all results, matching the upstream entity gate. Only the first conditioning step is needed for entity lists, even when the gate predicts a larger count. Repeated records use the separate structure mode below.
+Results are ordered by label, then descending confidence with source-position tie breaking. For span checkpoints, a predicted count of zero suppresses all results, matching the upstream entity gate. Only the first conditioning step is needed for entity lists, even when the gate predicts a larger count. Repeated records use the separate structure mode below.
 
-The published checkpoint permits spans of at most **8 upstream word/punctuation tokens**, not arbitrary-length summaries. Input must fit the schema-plus-text token budget (default 512, configurable up to 4096). This first version does **not** chunk long documents; exceeding the budget returns an error. `--max-words` is explicit truncation, not full-document extraction. The processor's synthetic terminal punctuation is encoded for parity but never returned as a standalone span; suffix offsets inside a URL are clipped to the original text.
+The English Decide checkpoint permits spans of at most **8 upstream word/punctuation tokens**, not arbitrary-length summaries. Input must fit the schema-plus-text token budget (default 512, configurable up to 4096). This first version does **not** chunk long documents; exceeding the budget returns an error. `--max-words` is explicit truncation, not full-document extraction. The processor's synthetic terminal punctuation is encoded for parity but never returned as a standalone span; suffix offsets inside a URL are clipped to the original text.
 
-CPU checks compare all raw candidate logits, count logits/gate, token/marker/word positions and decoded spans against upstream on six cases, including Unicode, URLs, truncation, empty text and the Cloudflare example. Synthetic F32/F16 coverage is part of the existing integration suite. CUDA/Metal builds use the same GGML graph but require their own new span-path hardware checks; prior classification parity does not establish span parity.
+CPU checks compare raw candidate logits, count logits/gate, routing and decoded spans on six English Decide cases. Boundary checkpoints have an eleven-case suite covering ordered pools, marginals, null/pair/proposal logits and decoded spans, including four additional languages. Both include Unicode, URLs, truncation, empty text and the Cloudflare example. Synthetic F32/F16 coverage is part of the existing integration suite. CUDA/Metal builds use the same GGML graph but require their own new span-path hardware checks; prior classification parity does not establish span parity.
 
 ## Count-conditioned structured extraction
+
+The examples below use English Decide's **span-architecture** count-conditioned head. Boundary checkpoints also support the same structure syntax using [instance-based records](#boundary-structured-extraction), not the count-conditioned GRU. Check `gliner_model_supports_records(ctx)` or `record_extraction` in `--inspect`, not just entity-span support.
 
 Use a **fixed record schema** when the model should discover multiple groups rather than the caller supplying topic labels:
 
@@ -301,6 +315,30 @@ Thresholding, overlap suppression and `--top-k` apply within each field and slot
 This first version supports one structure with ordered list/single extractive fields per call. It does not support nested records, enumerated-choice fields, field validators, mixed classification/entity/structure schemas or automatic long-document chunking. The structure name `entities` is reserved for the entity path. `--debug` exposes count logits and raw `[predicted_count, field_count, candidate_count]` record logits, plus field/word positions and candidate ranges, for parity checks and future fine-tuning evaluation.
 
 CPU reference checks cover real repeated-record examples and all slot logits. Synthetic F32/F16 cases exercise predicted counts 0, 1, 2, 3 and 19, recurrence, Unicode offsets, list/single decoding, empty-record filtering and safety-cap errors. CUDA/Metal hardware checks of the structured path remain pending.
+
+## Boundary structured extraction
+
+The four supported boundary checkpoints also accept `--structure search_requests --field terms`. Reconvert older GGUFs to include the record metadata; no fine-tuning or tensor pruning is required to enable the head:
+
+```powershell
+python .\convert\convert_hf_to_gguf.py .\models\gliner2.5-base-v1 .\models\gliner2.5-base-records.gguf
+.\build\Release\gliner-extract.exe --model .\models\gliner2.5-base-records.gguf `
+  --text-file .\request.txt --structure search_requests --field terms `
+  --description "terms=Verbatim search terms for one request needing additional context" `
+  --threshold 0.3 --top-k 5 --threads 4
+```
+
+**Anchorless is the default.** Add `--record-mode latent` to try span-seeded instances instead. Anchorless uses the checkpoint's 32 learned instance queries, conditioned on the shared candidate pool; latent mode scores candidate spans as potential instance seeds. Neither requires topic-specific labels or a caller-supplied anchor.
+
+Both modes run one encoder pass, the shared boundary candidate graph, then a record-only GGML graph using retained same-device features. Scalar fields select a softmax pointer with an explicit `ABSENT` alternative; list fields use independent assignment sigmoids. Candidate probabilities also gate returned spans. Final confidence is the minimum of pair and assignment probabilities, so it is **not** generally the sigmoid of the returned assignment `logit`.
+
+Record assignments are deduplicated before source filtering and weighted-flat overlap resolution, matching upstream. Identical-looking records can still remain after those later filters. `--top-k` applies to list fields after overlap resolution; `--allow-overlap` bypasses that resolution. Empty records are omitted. The shared pool has no eight-word span-width ceiling, but token/pool limits remain.
+
+Boundary JSON uses **`record_count`** (the number returned) and `record_mode`, rather than a misleading `predicted_count`: there is no count head. `slot_index` identifies the learned query in anchorless mode and the canonical pool candidate in latent mode (equivalent seeds repeated across fields share that identity). `max_span_width` is `null`. Debug output adds `n_instances`, `record_temperature`, field-major pair logits, object logits, and `[field, instance, candidate+1]` assignment logits with `ABSENT` in column zero.
+
+`--max-records` remains a **safety limit**, default 19, not a forced count. Boundary calls accept 1..4096; use `--max-records 32` to permit all learned-query slots or a larger cap such as 192 when exploring latent mode. Exceeding the cap fails without returning truncated results. English Decide retains its original 1..19 limit and rejects explicit boundary record modes.
+
+**Quality remains checkpoint-dependent.** On the Cloudflare fixture, anchorless mode returned no records at 0.3 for all four checkpoints. Small-model latent mode returned many records, not the desired two request groups; the other three latent runs returned none. This is implemented instance grouping, not a claim of useful retrieval queries. Fine-tuning may still be needed. Named-anchor/natural mode, exclusive/required fields, choices, validators, relations and mixed schemas remain unsupported. CUDA/Metal record-path hardware validation is pending.
 
 ## Performance benchmark
 
@@ -457,11 +495,11 @@ if (status == GLINER_STATUS_OK) {
 }
 ```
 
-`gliner_model_supports_spans` reports capability. Input pointers are borrowed for the call. Returned strings, arrays and `gliner_get_span_scores` diagnostic pointers are state-owned and valid until its next inference call or destruction. Offsets count UTF-8 bytes, not Unicode code points or UTF-16 code units. An empty match set is successful, not a fabricated fallback. Any failure clears results; switching between extraction and classification also clears the previous operation's results. Each state remains single-threaded; multiple states share immutable encoder and head weights.
+`gliner_model_supports_spans` reports entity capability for either supported architecture. Input pointers are borrowed for the call. Returned strings, arrays and architecture-specific `gliner_get_span_scores` or `gliner_get_boundary_scores` diagnostic pointers are state-owned and valid until its next inference call or destruction. Offsets count UTF-8 bytes, not Unicode code points or UTF-16 code units. An empty match set is successful, not a fabricated fallback. Any failure clears results; switching between extraction and classification also clears the previous operation's results. Each state remains single-threaded; multiple states share immutable encoder and head weights.
 
 ### Repeated record API
 
-Given the same span-capable `ctx` and an initialized `state`:
+Given a record-capable `ctx` (`gliner_model_supports_records(ctx) != 0`) and an initialized `state`:
 
 ```c
 const struct gliner_record_field fields[] = {
@@ -485,7 +523,7 @@ if (status == GLINER_STATUS_OK) {
 }
 ```
 
-`gliner_record` indexes the flat `gliner_get_record_spans` array; each span's `label_index` is its field index. Missing list/single fields have no span entries. `gliner_get_record_scores` provides raw slot logits and the predicted count, including count zero or all-empty decoded records. All results are state-owned until the next inference/free, and a failure clears them. Entity, record and classification result getters remain distinct and are cleared when switching operations.
+`gliner_record` indexes the flat `gliner_get_record_spans` array; each span's `label_index` is its field index. Missing list/single fields have no span entries. `options.mode` defaults to `GLINER_RECORD_AUTO`: count-conditioned on span checkpoints, anchorless on boundary checkpoints. Set `GLINER_RECORD_LATENT` or `GLINER_RECORD_ANCHORLESS` only for a boundary model. `gliner_get_record_scores` provides span-model count/slot diagnostics; `gliner_get_boundary_record_scores` provides boundary object/pair/assignment diagnostics. The non-applicable getter returns `NULL`. All results are state-owned until the next inference/free, and a failure clears them. Entity, record and classification result getters remain distinct and are cleared when switching operations.
 
 ### Initialize from a byte buffer
 
@@ -527,8 +565,8 @@ Loading uses GGML's GGUF callback parser and at most 8 MiB tensor-transfer chunk
 
 ## Scope and remaining work
 
-Supported: one text with jointly encoded classification tasks, grouped verbatim span labels, or one count-conditioned repeated-record schema per call; descriptions; list/single extractive fields; classification decoding and thresholded, overlap-resolved spans with the published Decide configuration.
+Supported: one text with jointly encoded classification tasks, grouped verbatim span labels or one repeated-record schema for English Decide and the four shared-pool boundary checkpoints; count-conditioned span records or anchorless/latent boundary records; descriptions; list/single record fields; classification decoding and thresholded, overlap-resolved spans.
 
-Not implemented: nested/choice-field/relation extraction, generated search queries, mixed classification/extraction or multiple structures in the same call, few-shot examples, constrained/beam/exact decision decoding, calibration fitting, automatic long-document chunking, alternate encoders/tokenizer pipelines, multi-document padded batching, quantization, memory-mapped weights, hybrid CPU/GPU offload or multi-GPU execution. Span/record GPU validation and broader hardware coverage remain pending. See [NEXT_STEPS.md](NEXT_STEPS.md).
+Not implemented: natural/named-anchor records, exclusive/required record fields, per-query boundary pools or boundary candidate/query attention layers, nested/choice-field/relation extraction, generated search queries, mixed classification/extraction or multiple structures in the same call, few-shot examples, constrained/beam/exact decision decoding, calibration fitting, automatic long-document chunking, alternate encoders/tokenizer pipelines, multi-document padded batching, quantization, memory-mapped weights, hybrid CPU/GPU offload or multi-GPU execution. Span/record GPU validation and broader hardware coverage remain pending. See [NEXT_STEPS.md](NEXT_STEPS.md).
 
 The model checkpoint is [Apache 2.0 licensed](https://huggingface.co/fastino/GLiNER2.5-Decide); review its license when redistributing converted weights. Checkpoints and generated GGUF files stay out of Git.

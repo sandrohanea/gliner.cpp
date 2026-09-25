@@ -51,11 +51,13 @@ static void span_layer(int layer, const float * values, int tokens, int hidden, 
     else ++*count;
 }
 
+static int test_loading(const char * path, struct gliner_context * reference);
+
 static int test_boundary(const char * path) {
     struct gliner_context * ctx = gliner_init_from_file(path);
     CHECK(ctx != NULL);
     CHECK(strcmp(gliner_model_architecture(ctx), "boundary") == 0);
-    CHECK(gliner_model_supports_text(ctx) && !gliner_model_supports_spans(ctx));
+    CHECK(gliner_model_supports_text(ctx) && !gliner_model_supports_records(ctx));
     struct gliner_state * state = gliner_init_state(ctx);
     CHECK(state != NULL);
     const char * labels[] = {"yes", "no"};
@@ -64,16 +66,43 @@ static int test_boundary(const char * path) {
     CHECK(gliner_classify_text_batch(ctx, state, "hello world", tasks, 2, NULL) == GLINER_STATUS_OK);
     CHECK(gliner_n_scores(state) == 4 && gliner_n_tasks(state) == 2);
     const struct gliner_span_label spans[] = {{"person", NULL}};
-    CHECK(gliner_extract_spans(ctx, state, "hello", spans, 1, NULL) == GLINER_STATUS_MODEL_ERROR);
-    CHECK(strstr(gliner_last_error(), "Boundary span") != NULL);
-    CHECK(gliner_n_scores(state) == 0 && gliner_n_tokens(state) == 0);
+    if (gliner_model_supports_spans(ctx)) {
+        struct gliner_span_params params = gliner_default_span_params();
+        params.threshold = 0;
+        params.max_spans_per_label = 1;
+        int calls = 0;
+        gliner_set_eval_callback(state, span_layer, &calls);
+        CHECK(gliner_extract_spans(ctx, state, "hello world", spans, 1, &params) == GLINER_STATUS_OK);
+        CHECK(calls == gliner_model_n_layers(ctx) + 1);
+        gliner_set_eval_callback(state, NULL, NULL);
+        CHECK(gliner_n_spans(state) == 1 && gliner_get_spans(state) != NULL);
+        CHECK(gliner_n_scores(state) == 0 && gliner_get_span_scores(state) == NULL);
+        const struct gliner_boundary_scores * raw = gliner_get_boundary_scores(state);
+        CHECK(raw && raw->n_labels == 1 && raw->n_words > 0 && raw->n_candidates > 0);
+        CHECK(raw->n_candidates <= raw->pool_capacity && isfinite(raw->null_logits[0]));
+        for (int i = 0; i < raw->n_candidates; ++i) {
+            CHECK(raw->start_words[i] < raw->end_words[i] && raw->end_words[i] <= raw->n_words);
+            CHECK(isfinite(raw->logits[i]) && isfinite(raw->proposal_logits[i]));
+        }
+        CHECK(gliner_extract_spans(ctx, state, "", spans, 1, &params) == GLINER_STATUS_OK);
+        CHECK(gliner_n_spans(state) == 0 && gliner_get_boundary_scores(state) != NULL);
+        params.max_tokens = 2;
+        CHECK(gliner_extract_spans(ctx, state, "hello", spans, 1, &params) == GLINER_STATUS_INVALID_ARGUMENT);
+        CHECK(gliner_get_boundary_scores(state) == NULL && gliner_n_tokens(state) == 0);
+    } else {
+        CHECK(gliner_extract_spans(ctx, state, "hello", spans, 1, NULL) == GLINER_STATUS_MODEL_ERROR);
+        CHECK(strstr(gliner_last_error(), "Boundary span") != NULL);
+        CHECK(gliner_n_scores(state) == 0 && gliner_n_tokens(state) == 0);
+    }
     const struct gliner_record_field fields[] = {{"terms", NULL, GLINER_FIELD_LIST}};
     CHECK(gliner_extract_records(ctx, state, "hello", "request", fields, 1, NULL) == GLINER_STATUS_MODEL_ERROR);
     CHECK(strstr(gliner_last_error(), "Boundary record") != NULL);
-    CHECK(gliner_get_record_scores(state) == NULL);
+    CHECK(gliner_get_record_scores(state) == NULL && gliner_get_boundary_scores(state) == NULL);
     CHECK(gliner_classify_text(ctx, state, "hello", "intent", labels, 2, NULL) == GLINER_STATUS_OK);
     CHECK(gliner_n_scores(state) == 2);
+    CHECK(gliner_get_boundary_scores(state) == NULL);
     gliner_free_state(state);
+    CHECK(test_loading(path, ctx) == 0);
     gliner_free(ctx);
     return 0;
 }
@@ -138,6 +167,97 @@ static int test_spans(const char * path) {
     CHECK(gliner_extract_spans(ctx, state, text, labels, 2, NULL) == GLINER_STATUS_OK);
     CHECK(gliner_score_label_states(ctx, state, NULL, 1, 1) == GLINER_STATUS_INVALID_ARGUMENT);
     CHECK(gliner_n_spans(state) == 0 && gliner_get_span_scores(state) == NULL);
+    gliner_free_state(state);
+    gliner_free(ctx);
+    return 0;
+}
+
+static int test_boundary_records(const char * path) {
+    struct gliner_context * ctx = gliner_init_from_file(path);
+    CHECK(ctx && gliner_model_supports_records(ctx) && gliner_model_supports_spans(ctx));
+    struct gliner_state * state = gliner_init_state(ctx);
+    CHECK(state);
+    const struct gliner_record_field fields[] = {
+        {"terms", "Verbatim search terms", GLINER_FIELD_LIST}, {"subject", NULL, GLINER_FIELD_SINGLE}};
+    const char * text = "Caf\xc3\xa9 Alice works at Contoso. Bob works elsewhere.";
+    struct gliner_record_params params = gliner_default_record_params();
+    CHECK(params.mode == GLINER_RECORD_AUTO);
+    params.threshold = 0;
+    params.max_records = 4096;
+    params.max_spans_per_field = 2;
+    for (int mode = GLINER_RECORD_AUTO; mode <= GLINER_RECORD_LATENT; ++mode) {
+        params.mode = (enum gliner_record_mode)mode;
+        int calls = 0;
+        gliner_set_eval_callback(state, span_layer, &calls);
+        CHECK(gliner_extract_records(ctx, state, text, "requests", fields, 2, &params) == GLINER_STATUS_OK);
+        CHECK(calls == gliner_model_n_layers(ctx) + 1);
+        gliner_set_eval_callback(state, NULL, NULL);
+        const struct gliner_boundary_record_scores * raw = gliner_get_boundary_record_scores(state);
+        CHECK(raw && raw->n_fields == 2 && raw->n_candidates > 0);
+        CHECK(raw->n_instances == (mode == GLINER_RECORD_LATENT ? 2 * raw->n_candidates : 4));
+        CHECK(raw->mode == (mode == GLINER_RECORD_LATENT ? GLINER_RECORD_LATENT : GLINER_RECORD_ANCHORLESS));
+        CHECK(gliner_get_record_scores(state) == NULL && gliner_get_boundary_scores(state) == NULL);
+        CHECK(gliner_n_spans(state) == 0 && gliner_n_scores(state) == 0 && gliner_n_tasks(state) == 0);
+        for (int i = 0; i < raw->n_instances; ++i) CHECK(isfinite(raw->object_logits[i]));
+        for (int i = 0; i < raw->n_instances * 2 * (raw->n_candidates + 1); ++i) CHECK(isfinite(raw->assignment_logits[i]));
+        const struct gliner_record * records = gliner_get_records(state);
+        const struct gliner_span * spans = gliner_get_record_spans(state);
+        CHECK(gliner_n_records(state) > 0);
+        for (int r = 0; r < gliner_n_records(state); ++r) {
+            CHECK(records[r].n_spans > 0 && records[r].n_spans <= 3);
+            CHECK(records[r].slot_index >= 0 && records[r].slot_index <
+                  (mode == GLINER_RECORD_LATENT ? raw->n_candidates : raw->n_instances));
+            for (int i = records[r].span_offset; i < records[r].span_offset + records[r].n_spans; ++i) {
+                CHECK(spans[i].end <= strlen(text) && spans[i].start < spans[i].end);
+                CHECK(strlen(spans[i].text) == spans[i].end - spans[i].start);
+                CHECK(memcmp(spans[i].text, text + spans[i].start, spans[i].end - spans[i].start) == 0);
+                CHECK(spans[i].probability >= 0 && spans[i].probability <= 1);
+            }
+        }
+        CHECK(gliner_extract_records(ctx, state, "", "requests", fields, 2, &params) == GLINER_STATUS_OK);
+        CHECK(gliner_n_records(state) == 0 && gliner_get_record_spans(state) == NULL);
+        params.max_tokens = 2;
+        CHECK(gliner_extract_records(ctx, state, text, "requests", fields, 2, &params) == GLINER_STATUS_INVALID_ARGUMENT);
+        CHECK(gliner_get_boundary_record_scores(state) == NULL && gliner_n_tokens(state) == 0);
+        params.max_tokens = 512;
+    }
+    params.mode = (enum gliner_record_mode)99;
+    CHECK(gliner_extract_records(ctx, state, text, "requests", fields, 2, &params) == GLINER_STATUS_INVALID_ARGUMENT);
+    params.mode = GLINER_RECORD_AUTO;
+    CHECK(gliner_extract_records(ctx, state, text, "requests", NULL, 2, &params) == GLINER_STATUS_INVALID_ARGUMENT);
+    CHECK(gliner_extract_records(ctx, state, text, "requests", fields, INT_MAX, &params) == GLINER_STATUS_INVALID_ARGUMENT);
+    const struct gliner_record_field duplicates[] = {{"x", NULL, GLINER_FIELD_LIST}, {"x", NULL, GLINER_FIELD_LIST}};
+    CHECK(gliner_extract_records(ctx, state, text, "requests", duplicates, 2, &params) == GLINER_STATUS_INVALID_ARGUMENT);
+    CHECK(gliner_extract_records(ctx, state, text, "requests", fields, 2, &params) == GLINER_STATUS_OK);
+    const char * labels[] = {"yes", "no"};
+    CHECK(gliner_classify_text(ctx, state, text, "intent", labels, 2, NULL) == GLINER_STATUS_OK);
+    CHECK(gliner_get_boundary_record_scores(state) == NULL && gliner_n_records(state) == 0);
+    gliner_free_state(state);
+    CHECK(test_loading(path, ctx) == 0);
+    gliner_free(ctx);
+    return 0;
+}
+
+static int test_boundary_record_limit(const char * path) {
+    struct gliner_context * ctx = gliner_init_from_file(path);
+    CHECK(ctx != NULL);
+    struct gliner_state * state = gliner_init_state(ctx);
+    CHECK(state != NULL);
+    const struct gliner_record_field field = {"term", NULL, GLINER_FIELD_SINGLE};
+    const char * text = "Alice works at Contoso. Bob works at Fabrikam.";
+    struct gliner_record_params params = gliner_default_record_params();
+    params.threshold = 0;
+    params.max_records = 4;
+    CHECK(gliner_extract_records(ctx, state, text, "requests", &field, 1, &params) == GLINER_STATUS_OK);
+    CHECK(gliner_n_records(state) >= 2);
+    params.max_records = 1;
+    CHECK(gliner_extract_records(ctx, state, text, "requests", &field, 1, &params) == GLINER_STATUS_INVALID_ARGUMENT);
+    CHECK(strstr(gliner_last_error(), "exceed max_records") != NULL);
+    CHECK(gliner_n_records(state) == 0 && gliner_n_tokens(state) == 0);
+    CHECK(gliner_get_record_spans(state) == NULL && gliner_get_boundary_record_scores(state) == NULL);
+    params.max_records = 4;
+    CHECK(gliner_extract_records(ctx, state, text, "requests", &field, 1, &params) == GLINER_STATUS_OK);
+    CHECK(gliner_n_records(state) >= 2);
     gliner_free_state(state);
     gliner_free(ctx);
     return 0;
@@ -358,7 +478,7 @@ static int compare_models(struct gliner_context * a, struct gliner_context * b) 
     CHECK(memcmp(gliner_get_token_ids(sa), gliner_get_token_ids(sb),
                  (size_t)gliner_n_tokens(sa) * sizeof(int32_t)) == 0);
     CHECK(memcmp(gliner_get_label_positions(sa), gliner_get_label_positions(sb), 2 * sizeof(int32_t)) == 0);
-    for (int i = 0; i < 4; ++i) CHECK(fabsf(gliner_get_label_states(sa)[i] - gliner_get_label_states(sb)[i]) < 1e-5f);
+    for (int i = 0; i < 2 * gliner_model_hidden_size(a); ++i) CHECK(fabsf(gliner_get_label_states(sa)[i] - gliner_get_label_states(sb)[i]) < 1e-5f);
     for (int i = 0; i < 2; ++i) CHECK(fabsf(gliner_get_scores(sa)[i].logit - gliner_get_scores(sb)[i].logit) < 1e-5f);
     const struct gliner_classification_task tasks[] = {
         {"intent", labels, 2, NULL, NULL},
@@ -372,6 +492,36 @@ static int compare_models(struct gliner_context * a, struct gliner_context * b) 
     CHECK(memcmp(gliner_get_token_ids(sa), gliner_get_token_ids(sb),
                  (size_t)gliner_n_tokens(sa) * sizeof(int32_t)) == 0);
     for (int i = 0; i < 3; ++i) CHECK(fabsf(gliner_get_scores(sa)[i].logit - gliner_get_scores(sb)[i].logit) < 1e-5f);
+    if (strcmp(gliner_model_architecture(a), "boundary") == 0 && gliner_model_supports_spans(a)) {
+        const struct gliner_span_label entities[] = {{"person", NULL}, {"place", NULL}};
+        CHECK(gliner_extract_spans(a, sa, "hello world", entities, 2, NULL) == GLINER_STATUS_OK);
+        CHECK(gliner_extract_spans(b, sb, "hello world", entities, 2, NULL) == GLINER_STATUS_OK);
+        const struct gliner_boundary_scores * ra = gliner_get_boundary_scores(sa);
+        const struct gliner_boundary_scores * rb = gliner_get_boundary_scores(sb);
+        CHECK(ra && rb && ra->n_candidates == rb->n_candidates);
+        for (int i = 0; i < ra->n_candidates; ++i) {
+            CHECK(ra->start_words[i] == rb->start_words[i] && ra->end_words[i] == rb->end_words[i]);
+            for (int label = 0; label < 2; ++label) {
+                const int at = label * ra->n_candidates + i;
+                CHECK(fabsf(ra->logits[at] - rb->logits[at]) < 1e-5f);
+            }
+            if (gliner_model_supports_records(a)) {
+                const struct gliner_record_field fields[] = {{"terms", NULL, GLINER_FIELD_LIST}};
+                for (int mode = GLINER_RECORD_ANCHORLESS; mode <= GLINER_RECORD_LATENT; ++mode) {
+                    struct gliner_record_params params = gliner_default_record_params();
+                    params.mode = (enum gliner_record_mode)mode;
+                    params.max_records = 4096;
+                    CHECK(gliner_extract_records(a, sa, "hello world", "requests", fields, 1, &params) == GLINER_STATUS_OK);
+                    CHECK(gliner_extract_records(b, sb, "hello world", "requests", fields, 1, &params) == GLINER_STATUS_OK);
+                    const struct gliner_boundary_record_scores * x = gliner_get_boundary_record_scores(sa);
+                    const struct gliner_boundary_record_scores * y = gliner_get_boundary_record_scores(sb);
+                    CHECK(x && y && x->n_candidates == y->n_candidates && x->n_instances == y->n_instances);
+                    for (int i = 0; i < x->n_instances; ++i) CHECK(fabsf(x->object_logits[i] - y->object_logits[i]) < 1e-5f);
+                    for (int i = 0; i < x->n_instances * (x->n_candidates + 1); ++i) CHECK(fabsf(x->assignment_logits[i] - y->assignment_logits[i]) < 1e-5f);
+                }
+            }
+        }
+    }
     gliner_free_state(sa);
     gliner_free_state(sb);
     return 0;
@@ -451,6 +601,8 @@ static int test_loading(const char * path, struct gliner_context * reference) {
 }
 
 int main(int argc, char ** argv) {
+    if (argc == 3 && strcmp(argv[1], "--boundary-record-limit") == 0) return test_boundary_record_limit(argv[2]);
+    if (argc == 3 && strcmp(argv[1], "--boundary-records") == 0) return test_boundary_records(argv[2]);
     if (argc == 3 && strcmp(argv[1], "--boundary") == 0) return test_boundary(argv[2]);
     if (argc == 4 && strcmp(argv[1], "--records") == 0) return test_records(argv[2], atoi(argv[3]));
     if (argc == 3 && strcmp(argv[1], "--spans") == 0) return test_spans(argv[2]);

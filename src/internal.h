@@ -52,6 +52,7 @@ public:
 private:
     int64_t array(const char * key, gguf_type type) const;
     gguf_context * ctx_ = nullptr;
+    std::unordered_map<std::string, std::string> aliases_;
 };
 
 struct Word {
@@ -119,6 +120,50 @@ private:
     ggml_tensor * linear(ggml_context * ctx, ggml_tensor * x, const std::string & name) const;
     ggml_tensor * projection(ggml_context * ctx, ggml_tensor * x, const std::string & name,
                             const char * final_layer) const;
+};
+
+struct BoundaryFeatures {
+    ggml_tensor * states;
+    ggml_tensor * queries;
+    ggml_tensor * content;
+    ggml_tensor * start;
+    ggml_tensor * end;
+    ggml_tensor * inside;
+    ggml_tensor * null_logits;
+    ggml_tensor * pool_start;
+    ggml_tensor * pool_end;
+    std::vector<ggml_tensor *> tensors() const {
+        return {states, queries, content, start, end, inside, null_logits, pool_start, pool_end};
+    }
+};
+
+class BoundaryHead {
+public:
+    BoundaryHead(const GgufFile & file, ggml_context * weights);
+    BoundaryFeatures build(ggml_context * ctx, ggml_tensor * encoded, ggml_tensor * words,
+                           ggml_tensor * labels, ggml_tensor * attention_mask) const;
+    ggml_tensor * score(ggml_context * ctx, const BoundaryFeatures & f, ggml_tensor * starts,
+                       ggml_tensor * ends, ggml_tensor * lengths, ggml_tensor * length_features,
+                       ggml_tensor *& compatibility) const;
+    int hidden, dim, pair_dim, content_dim, heads, attention_layers, window, refinement_layers, ffn_size;
+    int top_k, pool_size, quota;
+    float temperature, abstention_threshold;
+private:
+    std::unordered_map<std::string, ggml_tensor *> tensors_;
+    ggml_tensor * linear(ggml_context * ctx, ggml_tensor * x, const std::string & name) const;
+    ggml_tensor * norm(ggml_context * ctx, ggml_tensor * x, const std::string & name) const;
+};
+
+class BoundaryRecordHead {
+public:
+    BoundaryRecordHead(const GgufFile & file, ggml_context * weights);
+    ggml_tensor * build(ggml_context * ctx, const BoundaryFeatures & features, ggml_tensor * starts,
+                       ggml_tensor * ends, gliner_record_mode mode, ggml_tensor *& objects) const;
+    int hidden, dim, instances;
+    float temperature;
+private:
+    std::unordered_map<std::string, ggml_tensor *> tensors_;
+    ggml_tensor * linear(ggml_context * ctx, ggml_tensor * x, const std::string & name) const;
 };
 
 class Deberta {

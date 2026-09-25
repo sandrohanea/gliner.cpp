@@ -115,7 +115,8 @@ def boundary_contract(converter, binary, c_test, root, extract):
             converter.convert(root, model)
             preserved_tensors(model, tensors, dtype, version=3)
             inspect = run(binary, model, "--inspect")
-            assert "architecture: boundary\n" in inspect and "span_extraction: no" in inspect, inspect
+            assert "architecture: boundary\n" in inspect and "span_extraction: yes" in inspect, inspect
+            assert "record_extraction: no" in inspect, inspect
             result = json.loads(run(binary, model, "--labels", "first,second", "--states", str(states)))
             assert_close([s["logit"] for s in result["scores"]], [5.5, 3.5], 1e-5, "boundary head")
             result = json.loads(run(binary, model, "--text", "hello", "--task", "intent", "--labels", "first,second", "--debug"))
@@ -123,10 +124,14 @@ def boundary_contract(converter, binary, c_test, root, extract):
             assert len(result["scores"]) == 2 and result["task_offsets"] == [0, 2]
             subprocess.run([c_test, "--boundary", str(model)], check=True)
             if extract:
-                error = failure([extract], model, "--text", "hello", "--labels", "person")
-                assert "Boundary span extraction is not implemented" in error.stderr
+                result = json.loads(run([extract], model, "--text", "hello", "--labels", "person", "--threshold", "0"))
+                assert result["max_span_width"] is None and result["groups"][0]["spans"]
                 error = failure([extract], model, "--text", "hello", "--structure", "requests", "--field", "terms")
-                assert "Boundary record extraction is not implemented" in error.stderr
+                assert "Boundary record metadata is missing" in error.stderr
+            legacy = root / f"boundary-classification-{dtype}-{dropout}.gguf"
+            converter.convert(root, legacy, classification_only=True)
+            preserved_tensors(legacy, tensors, dtype, version=3)
+            subprocess.run([c_test, "--boundary", str(legacy)], check=True)
     tensors.pop("classifier.3.weight")
     write_safetensors(root / "model.safetensors", tensors)
     try:
@@ -138,6 +143,30 @@ def boundary_contract(converter, binary, c_test, root, extract):
     damaged = root / "boundary-capability.gguf"
     damaged.write_bytes(model.read_bytes().replace(b"classification", b"unsupportedxxx"))
     failure(binary, damaged, "--inspect")
+    tensors = create_checkpoint(root, boundary=True)
+    del tensors["boundary_head.shared_pool_scorer.content_pooler.value_projection.weight"]
+    write_safetensors(root / "model.safetensors", tensors)
+    try:
+        converter.convert(root, root / "boundary-missing-content.gguf")
+    except ValueError as error:
+        assert "content_pooler.value_projection.weight" in str(error)
+    else:
+        raise AssertionError("Missing boundary content tensor accepted")
+    create_checkpoint(root, boundary=True)
+    path = root / "config.json"
+    config = json.loads(path.read_text())
+    for key, value in (("candidate_pool", "per_query"), ("candidate_attention_layers", 1),
+                       ("query_attention_layers", 1), ("content_soft_max_pool", True),
+                       ("use_inside_evidence", False), ("pair_temperature", 0),
+                       ("pool_boundary_top_k", 257), ("boundary_attention_heads", 3)):
+        invalid = {**config, "boundary_head": {**config["boundary_head"], key: value}}
+        path.write_text(json.dumps(invalid), encoding="utf8")
+        try:
+            converter.convert(root, root / "boundary-invalid-config.gguf")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"Unsupported boundary setting accepted: {key}")
     create_checkpoint(root)
 
 
@@ -333,14 +362,17 @@ def batch_contract(binary, model, root):
     failure(binary, model, *args, "--states", str(root / "states.txt"))
 
 
-def span_contract(converter, extract, c_test, root, backend, fast_metal):
-    fixtures = json.loads((Path(__file__).parent / "fixtures" / "tiny_spans_parity.json").read_text(encoding="utf8"))["fixtures"]
+def span_contract(converter, extract, c_test, root, backend, fast_metal, boundary=False):
+    fixture_name = "tiny_boundary_parity.json" if boundary else "tiny_spans_parity.json"
+    fixtures = json.loads((Path(__file__).parent / "fixtures" / fixture_name).read_text(encoding="utf8"))["fixtures"]
     for dtype in ("F32", "F16"):
-        tensors = create_checkpoint(root, hidden=8, layers=2, dtype=dtype, spans=True)
-        model = root / f"spans-{dtype}.gguf"
+        if boundary and dtype == "F16":
+            fixtures = json.loads((Path(__file__).parent / "fixtures" / "tiny_boundary_f16_parity.json").read_text(encoding="utf8"))["fixtures"]
+        tensors = create_checkpoint(root, hidden=8, layers=2, dtype=dtype, spans=not boundary, boundary=boundary)
+        model = root / f"{'boundary-spans' if boundary else 'spans'}-{dtype}.gguf"
         converter.convert(root, model)
-        preserved_tensors(model, tensors, dtype)
-        subprocess.run([c_test, "--spans", str(model)], check=True)
+        preserved_tensors(model, tensors, dtype, version=3 if boundary else 2)
+        subprocess.run([c_test, "--boundary" if boundary else "--spans", str(model)], check=True)
         for expected in fixtures:
             case = expected["case"]
             args = ["--text", case["text"], "--debug", "--threads", "2", "--max-tokens", "2048"]
@@ -355,13 +387,28 @@ def span_contract(converter, extract, c_test, root, backend, fast_metal):
                 args += ["--allow-overlap"]
             actual = json.loads(run([extract], model, *args))
             assert actual["backend"] == backend and actual["offset_unit"] == "utf8_bytes"
-            for key in ("input_ids", "label_positions", "word_positions", "start_words", "end_words", "max_span_width"):
+            exact = ["input_ids", "label_positions", "word_positions", "max_span_width"]
+            if not boundary or (not fast_metal and dtype == "F32"):
+                exact += ["start_words", "end_words"]
+            for key in exact:
                 assert actual[key] == expected[key], (dtype, key)
             if not fast_metal:
                 tolerance = 5e-5 if dtype == "F32" else 5e-3
-                for key in ("span_logits", "count_logits"):
-                    assert_close(actual[key], expected[key], tolerance, f"{dtype} {key}")
-                assert actual["predicted_count"] == expected["predicted_count"]
+                reference_scores = expected
+                if boundary and dtype == "F16":
+                    pairs = list(zip(expected["all_start_words"], expected["all_end_words"]))
+                    lookup = {pair: i for i, pair in enumerate(pairs)}
+                    selected = [lookup[pair] for pair in zip(actual["start_words"], actual["end_words"])]
+                    reference_scores = {**expected,
+                        "span_logits": [expected["all_span_logits"][label * len(pairs) + i]
+                                        for label in range(len(case["labels"])) for i in selected],
+                        "proposal_logits": [expected["all_proposal_logits"][i] for i in selected]}
+                for key in (("span_logits", "null_logits", "start_logits", "end_logits", "proposal_logits") if boundary else ("span_logits", "count_logits")):
+                    assert_close(actual[key], reference_scores[key], tolerance, f"{dtype} {key}")
+                if boundary:
+                    assert actual["pool_capacity"] == expected["pool_capacity"]
+                else:
+                    assert actual["predicted_count"] == expected["predicted_count"]
             assert len(actual["groups"]) == len(case["labels"])
             source = case["text"].encode("utf8")
             for group, reference in zip(actual["groups"], expected["groups"]):
@@ -379,6 +426,54 @@ def span_contract(converter, extract, c_test, root, backend, fast_metal):
             failure([extract], model, *base, *bad)
         closed = json.loads(run([extract], model, *base, "--threshold", "1"))
         assert all(not group["spans"] for group in closed["groups"])
+    if boundary:
+        tensors["boundary_head.null_projection.bias"] = ([1], [1.])
+        write_safetensors(root / "model.safetensors", tensors)
+        gated = root / "boundary-abstain.gguf"
+        converter.convert(root, gated)
+        result = json.loads(run([extract], gated, "--text", "hello", "--labels", "a,b", "--threshold", "0", "--debug"))
+        assert result["null_logits"] == [1., 1.] and all(not g["spans"] for g in result["groups"])
+        for name, (shape, values) in list(tensors.items()):
+            if name.startswith("boundary_head."):
+                tensors[name] = (shape, [0.] * len(values))
+        # Zero null logits equal the abstention cutoff and must NOT suppress a label.
+        write_safetensors(root / "model.safetensors", tensors)
+        tied = root / "boundary-tied.gguf"
+        converter.convert(root, tied)
+        result = json.loads(run([extract], tied, "--text", "alpha beta gamma", "--labels", "term", "--threshold", "0.5"))
+        assert [s["text"] for s in result["groups"][0]["spans"]] == ["alpha", "beta", "gamma"], result
+        config_path = root / "config.json"
+        config = json.loads(config_path.read_text())
+        config["boundary_head"]["pool_boundary_top_k"] = 1
+        config["boundary_head"]["min_pool_per_query"] = 0
+        config["boundary_head"]["boundary_attention_layers"] = 0
+        config["boundary_head"]["boundary_refinement_layers"] = 0
+        config_path.write_text(json.dumps(config), encoding="utf8")
+        empty_pool = root / "boundary-empty-pool.gguf"
+        converter.convert(root, empty_pool)
+        result = json.loads(run([extract], empty_pool, "--text", "alpha beta", "--labels", "term", "--threshold", "0", "--debug"))
+        assert not result["span_logits"] and not result["groups"][0]["spans"]
+        config["boundary_head"]["pool_boundary_top_k"] = 4
+        config["boundary_head"]["pair_temperature"] = 2.
+        config_path.write_text(json.dumps(config), encoding="utf8")
+        tensors["boundary_head.shared_pool_scorer.film_output.3.bias"] = ([1], [2.])
+        write_safetensors(root / "model.safetensors", tensors)
+        scaled = root / "boundary-temperature.gguf"
+        converter.convert(root, scaled)
+        result = json.loads(run([extract], scaled, "--text", "alpha beta", "--labels", "term", "--debug"))
+        assert result["pair_temperature"] == 2.
+        assert_close([s["probability"] for s in result["groups"][0]["spans"]], [1 / (1 + math.exp(-1))] * 2, 5e-5, "boundary temperature")
+        config["boundary_head"]["pool_size"] = 1
+        config_path.write_text(json.dumps(config), encoding="utf8")
+        for side in ("start", "end"):
+            tensors[f"boundary_head.boundary_query_head.{side}_boundary_projection.bias"] = ([8], [1.] * 8)
+            tensors[f"boundary_head.boundary_query_head.{side}_query_projection.bias"] = ([8], [-10000.] * 8)
+        write_safetensors(root / "model.safetensors", tensors)
+        masked = root / "boundary-masked-proposals.gguf"
+        converter.convert(root, masked)
+        result = json.loads(run([extract], masked, "--text", "alpha beta", "--labels", "term", "--threshold", "0", "--debug"))
+        assert not result["span_logits"] and not result["groups"][0]["spans"]
+        return
     tensors["count_pred.2.bias"] = ([20], [2.] + [0.] * 19)
     write_safetensors(root / "model.safetensors", tensors)
     gated = root / "spans-gated.gguf"
@@ -394,6 +489,143 @@ def span_contract(converter, extract, c_test, root, backend, fast_metal):
     else:
         raise AssertionError("Missing span-conditioning tensor accepted")
     failure([extract], root / "model-F32.gguf", "--text", "hello", "--labels", "term")
+
+def boundary_record_contract(converter, extract, c_test, root, backend, fast_metal):
+    def arguments(case):
+        args = ["--text", case["text"], "--structure", case["structure"], "--record-mode", case["record_mode"],
+                "--max-records", "4096", "--threads", "2", "--max-tokens", "2048", "--debug"]
+        for f in case["fields"]:
+            args += ["--single-field" if f["type"] == "single" else "--field", f["name"]]
+            if "description" in f:
+                args += ["--description", f["name"] + "=" + f["description"]]
+        for key, option in (("threshold", "--threshold"), ("top_k", "--top-k"), ("max_words", "--max-words")):
+            if key in case:
+                args += [option, str(case[key])]
+        if case.get("allow_overlap"):
+            args += ["--allow-overlap"]
+        return args
+    for dtype in ("F32", "F16"):
+        name = "tiny_boundary_records_parity.json" if dtype == "F32" else "tiny_boundary_records_f16_parity.json"
+        fixtures = json.loads((Path(__file__).parent / "fixtures" / name).read_text(encoding="utf8"))["fixtures"]
+        tensors = create_checkpoint(root, hidden=8, layers=2, dtype=dtype, boundary=True, records=True)
+        model = root / f"boundary-records-{dtype}.gguf"
+        converter.convert(root, model)
+        preserved_tensors(model, tensors, dtype, version=3)
+        subprocess.run([c_test, "--boundary-records", str(model)], check=True)
+        for expected in fixtures:
+            case = expected["case"]
+            actual = json.loads(run([extract], model, *arguments(case)))
+            for key in ("input_ids", "field_positions", "word_positions", "record_mode", "n_instances", "max_span_width"):
+                assert actual[key] == expected[key], (dtype, key)
+            assert actual["backend"] == backend and actual["record_count"] == len(actual["records"])
+            count, instances, fields = len(actual["start_words"]), actual["n_instances"], len(case["fields"])
+            assert len(actual["assignment_logits"]) == fields * instances * (count + 1)
+            if not fast_metal:
+                pairs = list(zip(expected["start_words"], expected["end_words"]))
+                native_pairs = list(zip(actual["start_words"], actual["end_words"]))
+                if dtype == "F32":
+                    assert native_pairs == pairs, case
+                else:
+                    assert set(native_pairs) == set(pairs), case
+                lookup = {pair: i for i, pair in enumerate(pairs)}
+                permutation = [lookup[pair] for pair in native_pairs]
+                rows = list(range(instances)) if case["record_mode"] == "anchorless" else [
+                    f * count + c for f in range(fields) for c in permutation]
+                objects = [expected["object_logits"][i] for i in rows]
+                assignments = [expected["assignment_logits"][(f * instances + i) * (count + 1) + c]
+                               for f in range(fields) for i in rows for c in [0] + [p + 1 for p in permutation]]
+                pairs = [expected["pair_logits"][f * count + c] for f in range(fields) for c in permutation]
+                tolerance = 5e-5 if dtype == "F32" else 5e-3
+                for key, values in (("object_logits", objects), ("assignment_logits", assignments), ("pair_logits", pairs)):
+                    assert_close(actual[key], values, tolerance, f"boundary records {dtype} {case['record_mode']} {key}")
+            if dtype == "F32" and not fast_metal:
+                assert [r["slot_index"] for r in actual["records"]] == [r["slot_index"] for r in expected["records"]], case
+            source = case["text"].encode("utf8")
+            for r, record in enumerate(actual["records"]):
+                for f in case["fields"]:
+                    value = record["fields"][f["name"]]
+                    spans = value if f["type"] == "list" else [value] if value else []
+                    if dtype == "F32" and not fast_metal:
+                        ref = expected["records"][r]["fields"][f["name"]]
+                        ref = ref if f["type"] == "list" else [ref] if ref else []
+                        assert [(v["text"], v["start"], v["end"]) for v in spans] == [
+                            (v["text"], v["start"], v["end"]) for v in ref], (case, spans, ref)
+                        assert_close([v["probability"] for v in spans], [v["probability"] for v in ref], 5e-5, "record confidence")
+                    for span in spans:
+                        assert 0 <= span["start"] < span["end"] <= len(source)
+                        assert source[span["start"]:span["end"]].decode("utf8") == span["text"]
+        base = ["--text", "alpha beta", "--structure", "requests", "--field", "terms"]
+        for bad in (["--record-mode", "bad"], ["--max-records", "0"], ["--max-records", "4097"], ["--threshold", "nan"]):
+            failure([extract], model, *base, *bad)
+        default = json.loads(run([extract], model, *base, "--debug"))
+        explicit = json.loads(run([extract], model, *base, "--record-mode", "anchorless", "--debug"))
+        assert default == explicit
+        failure([extract], model, "--text", "alpha", "--labels", "x", "--record-mode", "latent")
+    # Orthogonal learned queries must produce distinct scalar assignments, not copies of slot zero.
+    for name, (shape, values) in list(tensors.items()):
+        if name.startswith("record_decoder."):
+            tensors[name] = (shape, [0.] * len(values))
+    tensors["record_decoder.object_head.bias"] = ([1], [2.])
+    tensors["record_decoder.instance_embed"] = ([4, 8], [
+        1, 0, 0, 1, 0, 0, 0, 0, -1, 0, 0, 1, 0, 0, 0, 0,
+        0, 1, 0, 1, 0, 0, 0, 0, 0, -1, 0, 1, 0, 0, 0, 0])
+    tensors["record_decoder.inst_proj.weight"] = ([4, 8], [float(i == j) for i in range(4) for j in range(8)])
+    tensors["record_decoder.cand_proj.weight"] = ([4, 8], [20. if i == j and i < 2 else 0. for i in range(4) for j in range(8)])
+    tensors["record_decoder.null_embed"] = ([4], [0., 0., 0., -100.])
+    write_safetensors(root / "model.safetensors", tensors)
+    distinct = root / "boundary-records-distinct.gguf"
+    converter.convert(root, distinct)
+    distinct_args = ["--text", "Alice works at Contoso. Bob works at Fabrikam.", "--structure", "requests",
+                     "--single-field", "term", "--threshold", "0", "--max-records", "4", "--debug"]
+    result = json.loads(run([extract], distinct, *distinct_args))
+    assert result["record_count"] >= 2 and len({r["fields"]["term"]["text"] for r in result["records"]}) >= 2
+    error = failure([extract], distinct, *distinct_args, "--max-records", "1")
+    assert "exceed max_records" in error.stderr
+    subprocess.run([c_test, "--boundary-record-limit", str(distinct)], check=True)
+    # No-object and empty-pool cases still expose raw diagnostics without fabricated records.
+    for name in ("object_head", "latent_seed_head"):
+        tensors[f"record_decoder.{name}.weight"] = ([1, 8], [0.] * 8)
+        tensors[f"record_decoder.{name}.bias"] = ([1], [-100.])
+    write_safetensors(root / "model.safetensors", tensors)
+    closed = root / "boundary-records-no-object.gguf"
+    converter.convert(root, closed)
+    for mode in ("anchorless", "latent"):
+        result = json.loads(run([extract], closed, *base, "--record-mode", mode, "--debug"))
+        assert result["record_count"] == 0 and result["object_logits"] and all(v == -100 for v in result["object_logits"])
+    config = json.loads((root / "config.json").read_text())
+    config["boundary_head"]["pool_boundary_top_k"] = 1
+    for name, (shape, values) in list(tensors.items()):
+        if name.startswith("boundary_head."):
+            tensors[name] = (shape, [0.] * len(values))
+    (root / "config.json").write_text(json.dumps(config), encoding="utf8")
+    write_safetensors(root / "model.safetensors", tensors)
+    empty = root / "boundary-records-empty-pool.gguf"
+    converter.convert(root, empty)
+    for mode in ("anchorless", "latent"):
+        result = json.loads(run([extract], empty, *base, "--record-mode", mode, "--threshold", "0", "--debug"))
+        assert result["record_count"] == 0 and not result["pair_logits"]
+        assert result["n_instances"] == (4 if mode == "anchorless" else 0)
+    del tensors["record_decoder.inst_proj.weight"]
+    write_safetensors(root / "model.safetensors", tensors)
+    try:
+        converter.convert(root, root / "boundary-records-invalid.gguf")
+    except ValueError as error:
+        assert "record_decoder.inst_proj.weight" in str(error)
+    else:
+        raise AssertionError("Missing record tensor accepted")
+    config_path = root / "config.json"
+    create_checkpoint(root, hidden=8, layers=2, boundary=True, records=True)
+    config = json.loads(config_path.read_text())
+    for key, value in (("record_dim", 0), ("record_instance_queries", 257), ("record_temperature", 0)):
+        invalid = {**config, "boundary_head": {**config["boundary_head"], key: value}}
+        config_path.write_text(json.dumps(invalid), encoding="utf8")
+        try:
+            converter.convert(root, root / "boundary-record-invalid-config.gguf")
+        except ValueError as error:
+            assert key in str(error)
+        else:
+            raise AssertionError(f"Invalid record setting accepted: {key}")
+
 
 def record_contract(converter, extract, c_test, root, backend, fast_metal):
     fixtures = json.loads((Path(__file__).parent / "fixtures" / "tiny_records_parity.json").read_text(encoding="utf8"))["fixtures"]
@@ -543,6 +775,9 @@ def main(converter_path, executable, c_test, expected_backend=None, fast_metal=F
             span_contract(converter, extract, c_test, root, backend, fast_metal)
             record_contract(converter, extract, c_test, root, backend, fast_metal)
         boundary_contract(converter, binary, c_test, root, extract)
+        if extract:
+            span_contract(converter, extract, c_test, root, backend, fast_metal, boundary=True)
+            boundary_record_contract(converter, extract, c_test, root, backend, fast_metal)
         negative_conversion(converter, binary, root)
     if fast_metal:
         print("Conversion, C API and CLI checks passed on fast Metal; strict encoder parity was not run")

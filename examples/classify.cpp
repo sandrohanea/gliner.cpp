@@ -183,7 +183,8 @@ int run(const std::vector<std::string> & args) {
                       << "hidden_size: " << gliner_model_hidden_size(model.get()) << '\n'
                       << "encoder_layers: " << gliner_model_n_layers(model.get()) << '\n'
                       << "span_extraction: " << (gliner_model_supports_spans(model.get()) ? "yes" :
-                          boundary ? "no (boundary head not implemented)" : "no (reconversion may be required)") << '\n'
+                          boundary ? "no (classification-only GGUF; reconversion required)" : "no (reconversion may be required)") << '\n'
+                      << "record_extraction: " << (gliner_model_supports_records(model.get()) ? "yes" : "no") << '\n'
                       << "backend: " << gliner_model_backend_name(model.get()) << '\n'
                       << "device: " << gliner_model_device_name(model.get()) << '\n'
                       << "text_inference: " << (gliner_model_supports_text(model.get()) ? "yes" : "no (legacy GGUF)") << '\n';

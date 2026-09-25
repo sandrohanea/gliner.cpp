@@ -105,6 +105,7 @@ add_library(gliner STATIC
     src/classify.cpp
     src/tokenizer.cpp
     src/span.cpp
+    src/boundary.cpp
     src/deberta.cpp)
 target_include_directories(gliner PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(gliner PUBLIC ${GLINER_GGML_TARGET} PRIVATE gliner_unicode)
@@ -140,6 +141,9 @@ if(BUILD_TESTING)
     set(GLINER_PARITY_CHECKPOINT "" CACHE PATH "Optional real checkpoint for live Python parity")
     set(GLINER_PARITY_GGUF "" CACHE FILEPATH "Converted GGUF for live Python parity")
     set(GLINER_SPAN_PARITY_GGUF "" CACHE FILEPATH "Optional reconverted span-enabled GGUF for upstream extraction parity")
+    set(GLINER_BOUNDARY_PARITY_CHECKPOINT "" CACHE PATH "Optional shared-pool boundary checkpoint for live entity parity")
+    set(GLINER_BOUNDARY_PARITY_GGUF "" CACHE FILEPATH "Boundary extraction-enabled GGUF for live entity parity")
+    set(GLINER_BOUNDARY_RECORD_PARITY_GGUF "" CACHE FILEPATH "Boundary record-enabled GGUF for live anchorless/latent parity")
     add_executable(gliner-test tests/test_core.c)
     target_link_libraries(gliner-test PRIVATE gliner)
     set_target_properties(gliner-test PROPERTIES LINKER_LANGUAGE CXX C_STANDARD 11 C_STANDARD_REQUIRED YES C_EXTENSIONS OFF)
@@ -218,6 +222,24 @@ if(BUILD_TESTING)
                     --binary "$<TARGET_FILE:gliner-extract>" --records-only --expect-backend "${GLINER_COMPILED_BACKEND}")
             set_tests_properties(gliner-real-record-parity PROPERTIES LABELS "parity;records;${GLINER_COMPILED_BACKEND}" TIMEOUT 600)
             list(APPEND GLINER_PARITY_TESTS gliner-real-record-parity)
+        endif()
+        if(GLINER_BOUNDARY_PARITY_CHECKPOINT AND GLINER_BOUNDARY_PARITY_GGUF AND
+                (NOT GLINER_BUILD_METAL OR GLINER_METAL_STRICT_F32))
+            add_test(NAME gliner-real-boundary-parity
+                COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_parity.py"
+                    --checkpoint "${GLINER_BOUNDARY_PARITY_CHECKPOINT}" --gguf "${GLINER_BOUNDARY_PARITY_GGUF}"
+                    --binary "$<TARGET_FILE:gliner-extract>" --boundary-spans-only --expect-backend "${GLINER_COMPILED_BACKEND}")
+            set_tests_properties(gliner-real-boundary-parity PROPERTIES LABELS "parity;boundary;${GLINER_COMPILED_BACKEND}" TIMEOUT 600)
+            list(APPEND GLINER_PARITY_TESTS gliner-real-boundary-parity)
+        endif()
+        if(GLINER_BOUNDARY_PARITY_CHECKPOINT AND GLINER_BOUNDARY_RECORD_PARITY_GGUF AND
+                (NOT GLINER_BUILD_METAL OR GLINER_METAL_STRICT_F32))
+            add_test(NAME gliner-real-boundary-record-parity
+                COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_parity.py"
+                    --checkpoint "${GLINER_BOUNDARY_PARITY_CHECKPOINT}" --gguf "${GLINER_BOUNDARY_RECORD_PARITY_GGUF}"
+                    --binary "$<TARGET_FILE:gliner-extract>" --boundary-records-only --expect-backend "${GLINER_COMPILED_BACKEND}")
+            set_tests_properties(gliner-real-boundary-record-parity PROPERTIES LABELS "parity;boundary;records;${GLINER_COMPILED_BACKEND}" TIMEOUT 600)
+            list(APPEND GLINER_PARITY_TESTS gliner-real-boundary-record-parity)
         endif()
     endif()
     if(GLINER_COMPILED_BACKEND STREQUAL "cuda")

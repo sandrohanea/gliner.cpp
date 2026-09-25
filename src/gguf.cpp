@@ -76,6 +76,18 @@ GgufFile::GgufFile(ModelReader & reader) {
         if (family != "gliner2.5-decide" && family != "gliner2") {
             throw std::runtime_error("GGUF is not a supported GLiNER2 checkpoint");
         }
+        if (has("gliner.tensor_name_map.original") || has("gliner.tensor_name_map.stored")) {
+            const auto original = strings("gliner.tensor_name_map.original");
+            const auto stored = strings("gliner.tensor_name_map.stored");
+            if (original.size() != stored.size()) throw std::runtime_error("Invalid tensor alias map");
+            std::unordered_map<std::string, bool> used;
+            for (size_t i = 0; i < original.size(); ++i) {
+                if (original[i].empty() || stored[i].empty() || !aliases_.emplace(original[i], stored[i]).second ||
+                    !used.emplace(stored[i], true).second || gguf_find_tensor(ctx_, stored[i].c_str()) < 0) {
+                    throw std::runtime_error("Invalid tensor alias mapping");
+                }
+            }
+        }
         const uint64_t start = gguf_get_data_offset(ctx_);
         for (int i = 0; i < tensor_count(); ++i) {
             const uint64_t offset = gguf_get_tensor_offset(ctx_, i);
@@ -162,7 +174,9 @@ std::vector<double> GgufFile::doubles(const char * key) const {
 
 ggml_tensor * GgufFile::tensor(ggml_context * ctx, const std::string & name,
                              std::initializer_list<int64_t> shape) const {
-    const int64_t id = gguf_find_tensor(ctx_, name.c_str());
+    const auto alias = aliases_.find(name);
+    const auto & stored = alias == aliases_.end() ? name : alias->second;
+    const int64_t id = gguf_find_tensor(ctx_, stored.c_str());
     if (id < 0) throw std::runtime_error("Missing tensor: " + name);
     const ggml_type type = gguf_get_tensor_type(ctx_, id);
     if (type != GGML_TYPE_F32 && type != GGML_TYPE_F16) {
@@ -175,7 +189,7 @@ ggml_tensor * GgufFile::tensor(ggml_context * ctx, const std::string & name,
     }
     ggml_tensor * tensor = ggml_new_tensor(ctx, type, static_cast<int>(shape.size()), dims);
     if (!tensor) throw std::runtime_error("Failed to allocate tensor");
-    ggml_set_name(tensor, name.c_str());
+    ggml_set_name(tensor, stored.c_str());
     const size_t bytes = gguf_get_tensor_size(ctx_, id);
     if (ggml_nbytes(tensor) != bytes) throw std::runtime_error("GGUF tensor size mismatch");
     return tensor;

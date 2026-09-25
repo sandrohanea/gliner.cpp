@@ -228,7 +228,108 @@ def span_shapes(hidden):
     return shapes
 
 
-def metadata(directory):
+def boundary_metadata(config, hidden):
+    required = {"candidate_pool": "shared", "candidate_attention_layers": 0, "query_attention_layers": 0,
+                "content_soft_max_pool": False, "enable_span_content": True, "use_inside_evidence": True,
+                "enable_abstention": True, "adaptive_threshold": False, "overlap_policy": "flat"}
+    for key, expected in required.items():
+        if config.get(key) != expected:
+            raise ValueError(f"Unsupported boundary extraction {key}: expected {expected!r}")
+    limits = {"boundary_dim": (1, 4096), "pair_dim": (1, 4096), "content_dim": (1, 4096),
+              "boundary_attention_heads": (1, 128), "boundary_attention_layers": (0, 16),
+              "boundary_attention_window": (0, 4096), "boundary_refinement_layers": (0, 16),
+              "pool_boundary_top_k": (1, 256), "pool_size": (1, 4096), "min_pool_per_query": (0, 256)}
+    for key, (lo, hi) in limits.items():
+        if type(config.get(key)) is not int or not lo <= config[key] <= hi:
+            raise ValueError(f"Invalid boundary extraction {key}")
+    d, p, c = (config[k] for k in ("boundary_dim", "pair_dim", "content_dim"))
+    if d % config["boundary_attention_heads"]:
+        raise ValueError("boundary_dim must be divisible by attention heads")
+    multiplier = config.get("boundary_ffn_multiplier")
+    if not isinstance(multiplier, (float, int)) or not math.isfinite(multiplier) or not 0 < multiplier <= 16:
+        raise ValueError("Invalid boundary_ffn_multiplier")
+    ffn = max(1, int(d * multiplier))
+    temperature = config.get("pair_temperature")
+    abstention = config.get("abstention_threshold")
+    if not isinstance(temperature, (float, int)) or not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError("Invalid pair_temperature")
+    if not isinstance(abstention, (float, int)) or not math.isfinite(abstention) or not 0 <= abstention <= 1:
+        raise ValueError("Invalid abstention_threshold")
+    kv = [("gliner.boundary.variant", KV_STRING, "shared-v1"),
+          ("gliner.boundary.ffn_size", KV_U32, ffn),
+          ("gliner.boundary.pair_temperature", KV_F32, float(temperature)),
+          ("gliner.boundary.abstention_threshold", KV_F32, float(abstention))]
+    kv += [("gliner.boundary." + key, KV_U32, config[key]) for key in limits]
+    shapes = {}
+    def linear(name, width, height):
+        shapes["boundary_head." + name + ".weight"] = (height, width)
+        shapes["boundary_head." + name + ".bias"] = (height,)
+    def norm(name, width):
+        shapes["boundary_head." + name + ".weight"] = (width,)
+        shapes["boundary_head." + name + ".bias"] = (width,)
+    for side in ("left", "right"):
+        linear("boundary_encoder." + side + "_projection", hidden, d)
+    for side in ("bos", "eos"):
+        shapes["boundary_head.boundary_encoder." + side + "_state"] = (hidden,)
+    linear("boundary_encoder.output_projection", 2 * d, d)
+    norm("boundary_encoder.layer_norm", d)
+    for i in range(config["boundary_attention_layers"]):
+        prefix = f"boundary_encoder.attention_blocks.{i}."
+        norm(prefix + "norm", d)
+        linear(prefix + "qkv_projection", d, 3 * d)
+        linear(prefix + "output_projection", d, d)
+    for i in range(config["boundary_refinement_layers"]):
+        prefix = f"boundary_encoder.refinement_blocks.{i}."
+        norm(prefix + "norm", d)
+        linear(prefix + "input_projection", d, 2 * ffn)
+        linear(prefix + "output_projection", ffn, d)
+    for side in ("start", "end"):
+        linear(f"boundary_query_head.{side}_boundary_projection", d, d)
+        linear(f"boundary_query_head.{side}_query_projection", hidden, d)
+        linear(f"shared_pool_builder.{side}_projection", d, d)
+        linear(f"shared_pool_scorer.{side}_projection", d, p)
+    linear("boundary_query_head.inside_text_projection", hidden, d)
+    linear("boundary_query_head.inside_query_projection", hidden, d)
+    linear("null_projection", hidden, 1)
+    linear("shared_pool_scorer.content_pooler.value_projection", hidden, c)
+    norm("shared_pool_scorer.content_pooler.layer_norm", c)
+    linear("shared_pool_scorer.content_projection", c, p)
+    linear("shared_pool_scorer.length_projection", 3, p)
+    linear("shared_pool_scorer.prior_projection", 1, p)
+    norm("shared_pool_scorer.candidate_norm", p)
+    linear("shared_pool_scorer.query_projection", hidden, p)
+    linear("shared_pool_scorer.film", p, 2 * p)
+    linear("shared_pool_scorer.film_output.0", p, 64)
+    linear("shared_pool_scorer.film_output.3", 64, 1)
+    records = config.get("enable_records", False)
+    if type(records) is not bool:
+        raise ValueError("Invalid enable_records")
+    if records:
+        for key, limit in (("record_dim", 4096), ("record_instance_queries", 256)):
+            if type(config.get(key)) is not int or not 1 <= config[key] <= limit:
+                raise ValueError(f"Invalid {key}")
+        temperature = config.get("record_temperature")
+        if type(temperature) not in (int, float) or not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("Invalid record_temperature")
+        rd, ri = config["record_dim"], config["record_instance_queries"]
+        kv += [("gliner.boundary.record_variant", KV_STRING, "instances-v1"),
+               ("gliner.boundary.record_dim", KV_U32, rd),
+               ("gliner.boundary.record_instance_queries", KV_U32, ri),
+               ("gliner.boundary.record_temperature", KV_F32, float(temperature))]
+        linear("candidate_encoder", 2 * d, hidden)
+        for name, width, height in (
+            ("inst_proj", hidden, rd), ("field_proj", hidden, rd), ("cand_proj", hidden, rd),
+            ("q_proj", hidden, rd), ("k_proj", hidden, rd), ("v_proj", hidden, hidden),
+            ("object_head", hidden, 1), ("latent_seed_head", hidden, 1),
+        ):
+            shapes[f"record_decoder.{name}.weight"] = (height, width)
+            shapes[f"record_decoder.{name}.bias"] = (height,)
+        shapes["record_decoder.null_embed"] = (rd,)
+        shapes["record_decoder.instance_embed"] = (ri, hidden)
+    return kv, shapes
+
+
+def metadata(directory, classification_only=False):
     model_config = read_json(directory / "config.json")
     architecture = model_config.get("architecture")
     if architecture not in ("span", "boundary"):
@@ -338,8 +439,18 @@ def metadata(directory):
     shapes.update({"classifier.0.weight": (2 * h, h), "classifier.0.bias": (2 * h,),
                    f"classifier.{output_index}.weight": (1, 2 * h), f"classifier.{output_index}.bias": (1,)})
     if architecture == "boundary":
-        kv.append(("gliner.capabilities", KV_STRING, "classification"))
-    elif "span_head" in model_config:
+        if classification_only:
+            kv.append(("gliner.capabilities", KV_STRING, "classification"))
+        else:
+            if "[E]" not in added_tokens:
+                raise ValueError("Missing structural token [E]")
+            boundary_kv, boundary_shapes = boundary_metadata(boundary_head, h)
+            if boundary_head.get("enable_records", False) and "[C]" not in added_tokens:
+                raise ValueError("Missing structural token [C]")
+            capability = "classification,spans,records" if boundary_head.get("enable_records", False) else "classification,spans"
+            kv += [("gliner.capabilities", KV_STRING, capability), *boundary_kv]
+            shapes.update(boundary_shapes)
+    elif "span_head" in model_config and not classification_only:
         head = model_config["span_head"]
         width = head.get("max_width")
         if head.get("span_mode") != "markerV0" or model_config.get("counting_layer") != "count_lstm":
@@ -383,8 +494,8 @@ def write_kv(file, key, kind, value):
         raise ValueError(f"Unsupported metadata kind {kind}")
 
 
-def convert(directory, output):
-    kv, required_shapes = metadata(directory)
+def convert(directory, output, classification_only=False):
+    kv, required_shapes = metadata(directory, classification_only)
     tensors = []
     seen = set()
     for path in checkpoint_files(directory):
@@ -462,10 +573,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path, help="Local Hugging Face checkpoint directory")
     parser.add_argument("output", type=Path, help="Output GGUF path")
+    parser.add_argument("--classification-only", action="store_true",
+                        help="Validate/enable only classification; still preserve all checkpoint tensors")
     args = parser.parse_args()
     if args.output.exists():
         parser.error(f"Output already exists: {args.output}")
-    count = convert(args.checkpoint, args.output)
+    count = convert(args.checkpoint, args.output, args.classification_only)
     print(f"Wrote {count} tensors to {args.output}")
 
 

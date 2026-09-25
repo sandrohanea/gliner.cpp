@@ -19,14 +19,15 @@ void usage() {
         "  --structure NAME            Extract repeated records instead of entity groups\n"
         "  --field NAME                List-valued field; repeat for additional fields\n"
         "  --single-field NAME         Field containing only its best surviving span\n"
-        "  --max-records N             Safety limit 1..19 (default 19); excess is an error\n"
+        "  --record-mode MODE          Boundary records: anchorless (default) or latent\n"
+        "  --max-records N             Safety limit (default 19); span <=19, boundary <=4096\n"
         "  --threshold P               Inclusive probability cutoff (default 0.5)\n"
         "  --top-k N                   Maximum spans per label/list field after suppression (0 = all)\n"
         "  --allow-overlap             Keep overlapping spans within a label\n"
         "  --threads N                 CPU threads (default 1)\n"
         "  --max-tokens N              Schema + text limit, 1..4096 (default 512)\n"
         "  --max-words N               Explicit word truncation (0 = none)\n"
-        "  --debug                     Include tokens, word/label positions, count and raw span logits\n"
+        "  --debug                     Include tokens, routing and architecture-specific raw scores\n"
         "Returns verbatim UTF-8 spans and byte offsets. No generated terms or automatic long-text chunking.\n";
 }
 
@@ -46,6 +47,7 @@ int gliner_cli_main(const std::vector<std::string> & args) {
         std::string model_path, text, text_file;
         bool has_text = false, has_file = false, debug = false;
         bool has_labels = false, has_structure = false, has_record_limit = false;
+        gliner_record_mode record_mode = GLINER_RECORD_AUTO;
         int max_records = 19;
         std::vector<gliner_field_type> field_types;
         auto params = gliner_default_span_params();
@@ -71,6 +73,11 @@ int gliner_cli_main(const std::vector<std::string> & args) {
                 schema.labels.push_back(value);
                 field_types.push_back(arg == "--field" ? GLINER_FIELD_LIST : GLINER_FIELD_SINGLE);
             } else if (arg == "--max-records") { max_records = integer(value); has_record_limit = true; }
+            else if (arg == "--record-mode") {
+                if (value == "anchorless") record_mode = GLINER_RECORD_ANCHORLESS;
+                else if (value == "latent") record_mode = GLINER_RECORD_LATENT;
+                else throw std::invalid_argument("Record mode must be anchorless or latent");
+            }
             else if (arg == "--description") schema.description_args.push_back(value);
             else if (arg == "--threads") params.n_threads = integer(value);
             else if (arg == "--max-tokens") params.max_tokens = integer(value);
@@ -87,8 +94,8 @@ int gliner_cli_main(const std::vector<std::string> & args) {
             throw std::invalid_argument("Threads must be positive and max_tokens must be 1..4096");
         }
         if ((has_structure && (has_labels || field_types.empty())) ||
-            (!has_structure && (!field_types.empty() || has_record_limit)) || max_records < 1 || max_records > 19) {
-            throw std::invalid_argument("Use --structure with fields and max-records 1..19, or entity labels; do not mix the modes");
+            (!has_structure && (!field_types.empty() || has_record_limit || record_mode != GLINER_RECORD_AUTO)) || max_records < 1 || max_records > 4096) {
+            throw std::invalid_argument("Use --structure with fields and max-records 1..4096 (span <=19), or entity labels; do not mix the modes");
         }
         schema.validate(true);
         if (schema.labels.size() > static_cast<size_t>(params.max_tokens)) throw std::invalid_argument("Labels must fit max_tokens");
@@ -107,7 +114,7 @@ int gliner_cli_main(const std::vector<std::string> & args) {
             std::vector<gliner_record_field> fields;
             for (size_t i = 0; i < labels.size(); ++i) fields.push_back({labels[i].name, labels[i].description, field_types[i]});
             const gliner_record_params record_params = {params.n_threads, params.max_tokens, params.max_words,
-                params.threshold, max_records, params.max_spans_per_label, params.allow_overlap};
+                params.threshold, max_records, params.max_spans_per_label, params.allow_overlap, record_mode};
             status = gliner_extract_records(model.get(), state.get(), text.c_str(), schema.name.c_str(),
                                            fields.data(), static_cast<int>(fields.size()), &record_params);
         } else {
@@ -120,10 +127,15 @@ int gliner_cli_main(const std::vector<std::string> & args) {
             const auto * records = gliner_get_records(state.get());
             const auto * spans = gliner_get_record_spans(state.get());
             const auto * raw = gliner_get_record_scores(state.get());
+            const auto * boundary = gliner_get_boundary_record_scores(state.get());
             std::ostringstream output;
             output.imbue(std::locale::classic());
-            output << std::setprecision(9) << "{\"structure\":\"" << escape_json(schema.name)
-                   << "\",\"predicted_count\":" << raw->predicted_count << ",\"records\":[";
+            output << std::setprecision(9) << "{\"structure\":\"" << escape_json(schema.name) << '"';
+            if (boundary) {
+                output << ",\"record_count\":" << gliner_n_records(state.get()) << ",\"record_mode\":\""
+                       << (boundary->mode == GLINER_RECORD_LATENT ? "latent" : "anchorless") << '"';
+            } else output << ",\"predicted_count\":" << raw->predicted_count;
+            output << ",\"records\":[";
             for (int r = 0; r < gliner_n_records(state.get()); ++r) {
                 if (r) output << ',';
                 output << "{\"slot_index\":" << records[r].slot_index << ",\"fields\":{";
@@ -144,22 +156,34 @@ int gliner_cli_main(const std::vector<std::string> & args) {
                 }
                 output << "}}";
             }
-            output << "],\"offset_unit\":\"utf8_bytes\",\"max_span_width\":" << raw->max_width;
+            output << "],\"offset_unit\":\"utf8_bytes\",\"max_span_width\":";
+            if (boundary) output << "null"; else output << raw->max_width;
             if (debug) {
                 output << ",\"backend\":\"" << gliner_model_backend_name(model.get()) << "\",\"input_ids\":";
                 array(output, gliner_get_token_ids(state.get()), static_cast<size_t>(gliner_n_tokens(state.get())));
                 output << ",\"field_positions\":";
-                array(output, raw->field_positions, raw->n_fields);
+                array(output, boundary ? boundary->field_positions : raw->field_positions, labels.size());
                 output << ",\"word_positions\":";
-                array(output, raw->word_positions, raw->n_words);
+                array(output, boundary ? boundary->word_positions : raw->word_positions, boundary ? boundary->n_words : raw->n_words);
                 output << ",\"start_words\":";
-                array(output, raw->start_words, raw->n_candidates);
+                array(output, boundary ? boundary->start_words : raw->start_words, boundary ? boundary->n_candidates : raw->n_candidates);
                 output << ",\"end_words\":";
-                array(output, raw->end_words, raw->n_candidates);
-                output << ",\"record_logits\":";
-                array(output, raw->logits, static_cast<size_t>(raw->predicted_count) * raw->n_fields * raw->n_candidates);
-                output << ",\"count_logits\":";
-                array(output, raw->count_logits, 20);
+                array(output, boundary ? boundary->end_words : raw->end_words, boundary ? boundary->n_candidates : raw->n_candidates);
+                if (boundary) {
+                    output << ",\"architecture\":\"boundary\",\"n_instances\":" << boundary->n_instances
+                           << ",\"record_temperature\":" << boundary->temperature << ",\"pair_logits\":";
+                    array(output, boundary->pair_logits, static_cast<size_t>(boundary->n_fields) * boundary->n_candidates);
+                    output << ",\"object_logits\":";
+                    array(output, boundary->object_logits, boundary->n_instances);
+                    output << ",\"assignment_logits\":";
+                    array(output, boundary->assignment_logits,
+                          static_cast<size_t>(boundary->n_fields) * boundary->n_instances * (boundary->n_candidates + 1));
+                } else {
+                    output << ",\"record_logits\":";
+                    array(output, raw->logits, static_cast<size_t>(raw->predicted_count) * raw->n_fields * raw->n_candidates);
+                    output << ",\"count_logits\":";
+                    array(output, raw->count_logits, 20);
+                }
             }
             output << "}\n";
             std::cout << output.str();
@@ -167,6 +191,7 @@ int gliner_cli_main(const std::vector<std::string> & args) {
         }
         const auto * spans = gliner_get_spans(state.get());
         const auto * raw = gliner_get_span_scores(state.get());
+        const auto * boundary = gliner_get_boundary_scores(state.get());
         std::ostringstream output;
         output.imbue(std::locale::classic());
         output << std::setprecision(9) << "{\"groups\":[";
@@ -183,23 +208,39 @@ int gliner_cli_main(const std::vector<std::string> & args) {
             }
             output << "]}";
         }
-        output << "],\"offset_unit\":\"utf8_bytes\",\"max_span_width\":" << raw->max_width;
+        output << "],\"offset_unit\":\"utf8_bytes\",\"max_span_width\":";
+        if (boundary) output << "null";
+        else output << raw->max_width;
         if (debug) {
             output << ",\"backend\":\"" << gliner_model_backend_name(model.get()) << "\",\"input_ids\":";
             array(output, gliner_get_token_ids(state.get()), static_cast<size_t>(gliner_n_tokens(state.get())));
             output << ",\"label_positions\":";
-            array(output, raw->label_positions, raw->n_labels);
+            array(output, boundary ? boundary->label_positions : raw->label_positions, labels.size());
             output << ",\"word_positions\":";
-            array(output, raw->word_positions, raw->n_words);
+            array(output, boundary ? boundary->word_positions : raw->word_positions, boundary ? boundary->n_words : raw->n_words);
             output << ",\"start_words\":";
-            array(output, raw->start_words, raw->n_candidates);
+            array(output, boundary ? boundary->start_words : raw->start_words, boundary ? boundary->n_candidates : raw->n_candidates);
             output << ",\"end_words\":";
-            array(output, raw->end_words, raw->n_candidates);
+            array(output, boundary ? boundary->end_words : raw->end_words, boundary ? boundary->n_candidates : raw->n_candidates);
             output << ",\"span_logits\":";
-            array(output, raw->logits, static_cast<size_t>(raw->n_candidates) * raw->n_labels);
-            output << ",\"count_logits\":";
-            array(output, raw->count_logits, 20);
-            output << ",\"predicted_count\":" << raw->predicted_count;
+            array(output, boundary ? boundary->logits : raw->logits,
+                  labels.size() * static_cast<size_t>(boundary ? boundary->n_candidates : raw->n_candidates));
+            if (boundary) {
+                output << ",\"architecture\":\"boundary\",\"pool_capacity\":" << boundary->pool_capacity
+                       << ",\"pair_temperature\":" << boundary->pair_temperature
+                       << ",\"abstention_threshold\":" << boundary->abstention_threshold << ",\"null_logits\":";
+                array(output, boundary->null_logits, boundary->n_labels);
+                output << ",\"start_logits\":";
+                array(output, boundary->start_logits, static_cast<size_t>(boundary->n_labels) * (boundary->n_words + 1));
+                output << ",\"end_logits\":";
+                array(output, boundary->end_logits, static_cast<size_t>(boundary->n_labels) * (boundary->n_words + 1));
+                output << ",\"proposal_logits\":";
+                array(output, boundary->proposal_logits, boundary->n_candidates);
+            } else {
+                output << ",\"count_logits\":";
+                array(output, raw->count_logits, 20);
+                output << ",\"predicted_count\":" << raw->predicted_count;
+            }
         }
         output << "}\n";
         std::cout << output.str();

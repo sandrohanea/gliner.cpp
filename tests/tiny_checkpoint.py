@@ -56,8 +56,19 @@ def create_checkpoint(root, hidden=2, layers=1, dtype="F32", compact_tokens=Fals
     if boundary:
         if spans:
             raise ValueError("Synthetic boundary classification cannot declare a span head")
-        model_config.update(architecture="boundary", architecture_version=1,
-                            boundary_head={"dropout": classifier_dropout})
+        model_config.update(architecture="boundary", architecture_version=1, boundary_head={
+            "dropout": classifier_dropout, "candidate_pool": "shared",
+            "boundary_dim": 8, "pair_dim": 8, "content_dim": 4,
+            "boundary_attention_heads": 2, "boundary_attention_layers": 2, "boundary_attention_window": 4,
+            "boundary_refinement_layers": 1, "boundary_ffn_multiplier": 2.,
+            "pool_boundary_top_k": 4, "pool_size": 12, "min_pool_per_query": 2,
+            "candidate_attention_layers": 0, "candidate_attention_heads": 2, "query_attention_layers": 0,
+            "content_soft_max_pool": False, "enable_span_content": True, "use_inside_evidence": True,
+            "enable_abstention": True, "abstention_threshold": 0.5, "adaptive_threshold": False,
+            "overlap_policy": "flat", "pair_temperature": 1.})
+        if records:
+            model_config["boundary_head"].update(enable_records=True, record_dim=4, record_instance_queries=4,
+                                                record_temperature=1., pool_boundary_top_k=32, pool_size=192)
     if spans:
         model_config.update(max_width=8, counting_layer="count_lstm",
                             span_head={"span_mode": "markerV0", "max_width": 8})
@@ -68,7 +79,7 @@ def create_checkpoint(root, hidden=2, layers=1, dtype="F32", compact_tokens=Fals
 
     def tensor(name, shape, norm=False):
         seed = sum((i + 1) * ord(c) for i, c in enumerate(name)) % 997
-        if records:
+        if records or boundary:
             # Uncorrelated record fixtures avoid near-tied span scores from sinusoidal weights.
             generator = random.Random(seed)
             values = [(1.0 if norm else 0.0) + generator.uniform(-0.3, 0.3) for _ in range(math.prod(shape))]
@@ -133,5 +144,55 @@ def create_checkpoint(root, hidden=2, layers=1, dtype="F32", compact_tokens=Fals
             for suffix in ("weight", "bias"):
                 tensors[f"classifier.3.{suffix}"] = tensors.pop(f"classifier.2.{suffix}")
         tensors["boundary_head." + "long_component_name_" * 4 + ".weight"] = ([2, 3], list(range(6)))
+        def linear(name, width, height):
+            tensor("boundary_head." + name + ".weight", [height, width])
+            tensor("boundary_head." + name + ".bias", [height])
+        def norm(name, width):
+            tensor("boundary_head." + name + ".weight", [width], norm=True)
+            tensor("boundary_head." + name + ".bias", [width])
+        for side in ("left", "right"):
+            linear("boundary_encoder." + side + "_projection", hidden, 8)
+        for side in ("bos", "eos"):
+            tensor("boundary_head.boundary_encoder." + side + "_state", [hidden])
+        linear("boundary_encoder.output_projection", 16, 8)
+        norm("boundary_encoder.layer_norm", 8)
+        for i in range(2):
+            prefix = f"boundary_encoder.attention_blocks.{i}."
+            norm(prefix + "norm", 8)
+            linear(prefix + "qkv_projection", 8, 24)
+            linear(prefix + "output_projection", 8, 8)
+        norm("boundary_encoder.refinement_blocks.0.norm", 8)
+        linear("boundary_encoder.refinement_blocks.0.input_projection", 8, 32)
+        linear("boundary_encoder.refinement_blocks.0.output_projection", 16, 8)
+        for side in ("start", "end"):
+            linear(f"boundary_query_head.{side}_boundary_projection", 8, 8)
+            linear(f"boundary_query_head.{side}_query_projection", hidden, 8)
+            linear(f"shared_pool_builder.{side}_projection", 8, 8)
+            linear(f"shared_pool_scorer.{side}_projection", 8, 8)
+        linear("boundary_query_head.inside_text_projection", hidden, 8)
+        linear("boundary_query_head.inside_query_projection", hidden, 8)
+        tensors["boundary_head.null_projection.weight"] = ([1, hidden], [0.] * hidden)
+        tensors["boundary_head.null_projection.bias"] = ([1], [-1.])
+        linear("shared_pool_scorer.content_pooler.value_projection", hidden, 4)
+        norm("shared_pool_scorer.content_pooler.layer_norm", 4)
+        linear("shared_pool_scorer.content_projection", 4, 8)
+        linear("shared_pool_scorer.length_projection", 3, 8)
+        linear("shared_pool_scorer.prior_projection", 1, 8)
+        norm("shared_pool_scorer.candidate_norm", 8)
+        linear("shared_pool_scorer.query_projection", hidden, 8)
+        linear("shared_pool_scorer.film", 8, 16)
+        linear("shared_pool_scorer.film_output.0", 8, 64)
+        linear("shared_pool_scorer.film_output.3", 64, 1)
+        if records:
+            linear("candidate_encoder", 16, hidden)
+            for name, width, height in (
+                ("inst_proj", hidden, 4), ("field_proj", hidden, 4), ("cand_proj", hidden, 4),
+                ("q_proj", hidden, 4), ("k_proj", hidden, 4), ("v_proj", hidden, hidden),
+                ("object_head", hidden, 1), ("latent_seed_head", hidden, 1),
+            ):
+                tensor(f"record_decoder.{name}.weight", [height, width])
+                tensor(f"record_decoder.{name}.bias", [height])
+            tensor("record_decoder.null_embed", [4])
+            tensor("record_decoder.instance_embed", [4, hidden])
     write_safetensors(root / "model.safetensors", tensors, dtype)
     return tensors

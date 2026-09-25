@@ -14,8 +14,10 @@ void validate_deberta_metadata(const GgufFile & file) {
     if (architecture == "boundary" &&
         (!file.has("gliner.format_version") || file.u32("gliner.format_version") != 3 ||
          file.string("general.architecture") != "gliner2" ||
-         file.string("gliner.capabilities") != "classification" || file.has("gliner.span_mode"))) {
-        throw std::runtime_error("Boundary GGUF supports classification only in application format version 3");
+         (file.string("gliner.capabilities") != "classification" &&
+          file.string("gliner.capabilities") != "classification,spans" &&
+          file.string("gliner.capabilities") != "classification,spans,records") || file.has("gliner.span_mode"))) {
+        throw std::runtime_error("Unsupported boundary GGUF capabilities or application format");
     }
     if (file.string("gliner.token_pooling") != "first") {
         throw std::runtime_error("Only first-subword token pooling is supported");

@@ -12,6 +12,8 @@
 #include <fstream>
 #include <limits>
 #include <new>
+#include <numeric>
+#include <set>
 #include <stdexcept>
 #include <vector>
 
@@ -81,6 +83,8 @@ struct gliner_context {
     std::unique_ptr<gliner::Tokenizer> tokenizer;
     std::unique_ptr<gliner::Deberta> encoder;
     std::unique_ptr<gliner::SpanHead> span_head;
+    std::unique_ptr<gliner::BoundaryHead> boundary_head;
+    std::unique_ptr<gliner::BoundaryRecordHead> boundary_record_head;
 
     explicit gliner_context(gliner::ModelReader & reader)
         : device(select_device()), file(reader),
@@ -108,6 +112,12 @@ struct gliner_context {
                 encoder = std::make_unique<gliner::Deberta>(file, weights.value);
                 tokenizer = std::make_unique<gliner::Tokenizer>(file);
                 if (file.has("gliner.span_mode")) span_head = std::make_unique<gliner::SpanHead>(file, weights.value);
+                if (architecture == "boundary" && file.string("gliner.capabilities") != "classification") {
+                    boundary_head = std::make_unique<gliner::BoundaryHead>(file, weights.value);
+                    if (file.string("gliner.capabilities") == "classification,spans,records") {
+                        boundary_record_head = std::make_unique<gliner::BoundaryRecordHead>(file, weights.value);
+                    }
+                }
             }
             weight_buffer = ggml_backend_alloc_ctx_tensors(weights.value, backend);
             if (!weight_buffer) throw std::runtime_error(std::string("Cannot allocate model weights on ") + ggml_backend_dev_name(device));
@@ -142,6 +152,10 @@ struct gliner_state {
     std::vector<gliner_record> records;
     std::vector<gliner_span> record_spans;
     gliner_record_scores record_scores = {};
+    gliner_boundary_scores boundary_scores = {};
+    gliner_boundary_record_scores boundary_record_scores = {};
+    std::vector<float> record_objects, record_assignments;
+    std::vector<float> boundary_start, boundary_end, boundary_null, boundary_proposals;
     gliner_eval_callback callback = nullptr;
     void * callback_data = nullptr;
 
@@ -163,6 +177,10 @@ struct gliner_state {
         records.clear();
         record_spans.clear();
         record_scores = {};
+        boundary_scores = {};
+        boundary_record_scores = {};
+        record_objects.clear(); record_assignments.clear();
+        boundary_start.clear(); boundary_end.clear(); boundary_null.clear(); boundary_proposals.clear();
     }
 
     explicit gliner_state(const gliner_context * ctx) : owner(ctx) {
@@ -281,8 +299,8 @@ struct EncoderGraph {
     ggml_tensor * encoded;
     std::vector<ggml_tensor *> hidden;
 
-    EncoderGraph(const gliner_context * ctx, const gliner::Tokenized & tokens, bool capture)
-        : capacity(static_cast<size_t>(ctx->layers + 1) * 160 + 512),
+    EncoderGraph(const gliner_context * ctx, const gliner::Tokenized & tokens, bool capture, size_t extra_capacity = 0)
+        : capacity(static_cast<size_t>(ctx->layers + 1) * 160 + 512 + extra_capacity),
           eval(ggml_tensor_overhead() * capacity * 2 + ggml_graph_overhead_custom(capacity, false)) {
         ctx->encoder->relative_indices(static_cast<int>(tokens.ids.size()), c2p, p2c);
         ids = input(static_cast<int64_t>(tokens.ids.size()));
@@ -312,23 +330,43 @@ void candidate_indices(int words, int max_width, std::vector<int32_t> & starts, 
     }
 }
 
-std::vector<gliner_span> select_spans(const gliner::Tokenized & tokens, const std::vector<int32_t> & starts,
-                                     const std::vector<int32_t> & ends, const float * logits, int label,
-                                     float threshold, bool allow_overlap, int limit) {
-    std::vector<gliner_span> candidates, selected;
-    for (size_t i = 0; i < starts.size(); ++i) {
-        const auto & first = tokens.words[starts[i]];
-        const auto & last = tokens.words[ends[i]];
-        // Drop synthetic suffix tokens; offsets for a suffix inside a URL are clipped.
-        if (first.start == first.end || last.start == last.end) continue;
-        const float probability = sigmoid(logits[i]);
-        if (probability >= threshold) candidates.push_back({label, first.start, last.end, logits[i], probability, nullptr});
-    }
+std::vector<gliner_span> resolve_spans(std::vector<gliner_span> candidates, bool allow_overlap, int limit, bool weighted) {
+    std::vector<gliner_span> selected;
     std::stable_sort(candidates.begin(), candidates.end(), [](const gliner_span & a, const gliner_span & b) {
         if (a.probability != b.probability) return a.probability > b.probability;
         if (a.start != b.start) return a.start < b.start;
         return a.end < b.end;
     });
+    if (weighted && !allow_overlap) {
+        // Match upstream's maximum-total-confidence interval selection, not greedy NMS.
+        std::vector<size_t> order(candidates.size());
+        std::iota(order.begin(), order.end(), size_t(0));
+        std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            if (candidates[a].end != candidates[b].end) return candidates[a].end < candidates[b].end;
+            if (candidates[a].start != candidates[b].start) return candidates[a].start < candidates[b].start;
+            return a < b;
+        });
+        struct Choice { double score = 0; std::vector<size_t> indices; };
+        std::vector<Choice> best(order.size() + 1);
+        for (size_t i = 0; i < order.size(); ++i) {
+            size_t previous = 0;
+            for (size_t j = 0; j < i; ++j) if (candidates[order[j]].end <= candidates[order[i]].start) previous = j + 1;
+            auto take = best[previous];
+            take.score += candidates[order[i]].probability;
+            take.indices.push_back(order[i]);
+            std::sort(take.indices.begin(), take.indices.end());
+            const auto & skip = best[i];
+            const bool preferred = take.score > skip.score ||
+                (take.score == skip.score && (take.indices.size() > skip.indices.size() ||
+                 (take.indices.size() == skip.indices.size() && take.indices < skip.indices)));
+            best[i + 1] = preferred ? std::move(take) : skip;
+        }
+        for (size_t i : best.back().indices) {
+            selected.push_back(candidates[i]);
+            if (limit && selected.size() == static_cast<size_t>(limit)) break;
+        }
+        return selected;
+    }
     for (const auto & candidate : candidates) {
         if (!allow_overlap && std::any_of(selected.begin(), selected.end(), [&](const gliner_span & other) {
             return candidate.start < other.end && other.start < candidate.end;
@@ -339,11 +377,298 @@ std::vector<gliner_span> select_spans(const gliner::Tokenized & tokens, const st
     return selected;
 }
 
+std::vector<gliner_span> select_spans(const gliner::Tokenized & tokens, const std::vector<int32_t> & starts,
+                                     const std::vector<int32_t> & ends, const float * logits, int label,
+                                     float threshold, bool allow_overlap, int limit, bool weighted = false,
+                                     float temperature = 1.f) {
+    std::vector<gliner_span> candidates;
+    for (size_t i = 0; i < starts.size(); ++i) {
+        const auto & first = tokens.words[starts[i]];
+        const auto & last = tokens.words[ends[i]];
+        // Drop synthetic suffix tokens; offsets for a suffix inside a URL are clipped.
+        if (first.start == first.end || last.start == last.end) continue;
+        const float probability = sigmoid(logits[i] / temperature);
+        if (probability >= threshold) candidates.push_back({label, first.start, last.end, logits[i], probability, nullptr});
+    }
+    return resolve_spans(std::move(candidates), allow_overlap, limit, weighted);
+}
+
 std::vector<float> download_finite(ggml_tensor * tensor) {
     std::vector<float> values(static_cast<size_t>(ggml_nelements(tensor)));
     ggml_backend_tensor_get(tensor, values.data(), 0, values.size() * sizeof(float));
     for (float value : values) if (!std::isfinite(value)) throw std::runtime_error("Model produced nonfinite extraction logits");
     return values;
+}
+
+void decode_boundary_records(const gliner_context * ctx, gliner_state * state, const gliner_record_field * fields,
+                             const gliner_record_params & options, const gliner::Tokenized & tokens,
+                             const std::vector<int32_t> & starts, const std::vector<int32_t> & ends) {
+    const size_t count = starts.size(), n_fields = tokens.markers.size(), instances = state->record_objects.size();
+    const float temperature = ctx->boundary_record_head->temperature;
+    std::vector<size_t> order(instances);
+    std::iota(order.begin(), order.end(), size_t(0));
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return sigmoid(state->record_objects[a] / temperature) > sigmoid(state->record_objects[b] / temperature);
+    });
+    std::set<std::vector<std::vector<size_t>>> seen;
+    for (size_t inst : order) {
+        if (sigmoid(state->record_objects[inst] / temperature) < options.threshold) continue;
+        std::vector<std::vector<size_t>> selections(n_fields);
+        std::vector<std::vector<float>> probabilities(n_fields);
+        bool any = false;
+        for (size_t f = 0; f < n_fields; ++f) {
+            const auto * row = state->record_assignments.data() + (f * instances + inst) * (count + 1);
+            if (fields[f].type == GLINER_FIELD_SINGLE) {
+                const size_t chosen = static_cast<size_t>(std::max_element(row, row + count + 1) - row);
+                if (!chosen) continue;
+                float sum = 0.f;
+                for (size_t c = 0; c <= count; ++c) sum += std::exp((row[c] - row[chosen]) / temperature);
+                const float probability = 1.f / sum;
+                if (probability < options.threshold) continue;
+                selections[f].push_back(chosen - 1);
+                probabilities[f].push_back(probability);
+            } else {
+                for (size_t c = 0; c < count; ++c) {
+                    const float probability = sigmoid(row[c + 1] / temperature);
+                    if (probability < options.threshold) continue;
+                    selections[f].push_back(c);
+                    probabilities[f].push_back(probability);
+                }
+            }
+            any = any || !selections[f].empty();
+        }
+        // Upstream deduplicates assignments before source filtering and overlap resolution.
+        if (!any || !seen.insert(selections).second) continue;
+        const size_t offset = state->record_spans.size();
+        for (size_t f = 0; f < n_fields; ++f) {
+            std::vector<gliner_span> spans;
+            for (size_t j = 0; j < selections[f].size(); ++j) {
+                const size_t c = selections[f][j];
+                const auto & first = tokens.words[starts[c]], & last = tokens.words[ends[c]];
+                if (first.start == first.end || last.start == last.end) continue;
+                const float pair = sigmoid(state->span_logits[f * count + c] / ctx->boundary_head->temperature);
+                if (pair < options.threshold) continue;
+                const float logit = state->record_assignments[(f * instances + inst) * (count + 1) + c + 1];
+                spans.push_back({static_cast<int>(f), first.start, last.end, logit, std::min(pair, probabilities[f][j]), nullptr});
+            }
+            const int limit = fields[f].type == GLINER_FIELD_SINGLE ? 1 : options.max_spans_per_field;
+            const auto selected = resolve_spans(std::move(spans), options.allow_overlap != 0, limit, true);
+            if (selected.size() > static_cast<size_t>(std::numeric_limits<int>::max()) - state->record_spans.size()) {
+                throw std::runtime_error("Too many structured spans");
+            }
+            state->record_spans.insert(state->record_spans.end(), selected.begin(), selected.end());
+        }
+        if (state->record_spans.size() > offset) {
+            // Shared-pool latent seeds are repeated per field, but identify the same span.
+            const size_t slot = options.mode == GLINER_RECORD_LATENT ? inst % count : inst;
+            state->records.push_back({static_cast<int>(slot), static_cast<int>(offset), static_cast<int>(state->record_spans.size() - offset)});
+            if (state->records.size() > static_cast<size_t>(options.max_records)) {
+                throw std::invalid_argument("Selected records exceed max_records; no records were truncated");
+            }
+        }
+    }
+}
+
+int extract_boundary(const gliner_context * ctx, gliner_state * state, const std::string & source,
+                     const gliner::ClassificationTask & schema, const gliner_span_params & options,
+                     const gliner_record_field * record_fields = nullptr, const gliner_record_params * record_options = nullptr) {
+    const auto & head = *ctx->boundary_head;
+    const int labels = static_cast<int>(schema.labels.size());
+    auto tokens = ctx->tokenizer->encode(source, {schema}, options.max_words, options.max_tokens,
+                                        record_options ? gliner::SchemaKind::Records : gliner::SchemaKind::Entities);
+    const int words = static_cast<int>(tokens.words.size()), boundaries = words + 1;
+    EncoderGraph data(ctx, tokens, state->callback != nullptr,
+                       static_cast<size_t>(head.attention_layers + head.refinement_layers + 1) * 100);
+    auto * word_ids = data.input(words);
+    auto * label_ids = data.input(labels);
+    auto * mask = head.attention_layers ? ggml_new_tensor_2d(data.eval.value, GGML_TYPE_F32, boundaries, boundaries) : nullptr;
+    if (mask) ggml_set_input(mask);
+    const auto features = head.build(data.eval.value, data.encoded, word_ids, label_ids, mask);
+    auto * graph = ggml_new_graph_custom(data.eval.value, data.capacity, false);
+    for (auto * output : features.tensors()) {
+        ggml_set_output(output);
+        ggml_build_forward_expand(graph, output);
+    }
+    if (!allocate_graph(state, graph)) return GLINER_STATUS_BACKEND_ERROR;
+    data.upload(tokens);
+    ggml_backend_tensor_set(word_ids, tokens.word_positions.data(), 0, tokens.word_positions.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(label_ids, tokens.markers.data(), 0, tokens.markers.size() * sizeof(int32_t));
+    if (mask) {
+        std::vector<float> attention_mask(static_cast<size_t>(boundaries) * boundaries, 0.f);
+        if (head.window > 0) {
+            for (int i = 0; i < boundaries; ++i) for (int j = 0; j < boundaries; ++j) {
+                if (std::abs(i - j) > head.window) attention_mask[static_cast<size_t>(i) * boundaries + j] = -std::numeric_limits<float>::infinity();
+            }
+        }
+        ggml_backend_tensor_set(mask, attention_mask.data(), 0, attention_mask.size() * sizeof(float));
+    }
+    if (!compute(state, graph, options.n_threads)) return GLINER_STATUS_BACKEND_ERROR;
+    const auto start_logits = download_finite(features.start);
+    const auto end_logits = download_finite(features.end);
+    const auto null_logits = download_finite(features.null_logits);
+    notify_layers(state, data.hidden, static_cast<int>(tokens.ids.size()), ctx->hidden);
+
+    std::vector<float> union_start(boundaries, -10000.f), union_end(boundaries, -10000.f);
+    for (int i = 0; i < boundaries; ++i) for (int label = 0; label < labels; ++label) {
+        const size_t at = static_cast<size_t>(label) * boundaries + i;
+        if (!label || start_logits[at] > union_start[i]) union_start[i] = start_logits[at];
+        if (!label || end_logits[at] > union_end[i]) union_end[i] = end_logits[at];
+    }
+    auto top = [&](const std::vector<float> & scores) {
+        std::vector<int32_t> ids(boundaries);
+        std::iota(ids.begin(), ids.end(), 0);
+        std::stable_sort(ids.begin(), ids.end(), [&](int a, int b) { return scores[a] > scores[b]; });
+        ids.resize(static_cast<size_t>(std::min(boundaries, head.top_k)));
+        return ids;
+    };
+    const auto top_starts = top(union_start), top_ends = top(union_end);
+    std::vector<int32_t> starts, ends, pairs;
+    std::vector<float> lengths, length_features;
+    for (int32_t s : top_starts) for (int32_t e : top_ends) {
+        if (e <= s) { pairs.push_back(-1); continue; }
+        pairs.push_back(static_cast<int32_t>(starts.size()));
+        starts.push_back(s); ends.push_back(e);
+        const float length = static_cast<float>(e - s);
+        lengths.push_back(length);
+        length_features.insert(length_features.end(), {std::log1p(length), length / words, 1.f / std::sqrt(length)});
+    }
+    std::vector<float> logits, compatibility;
+    GraphContext retained(16 * ggml_tensor_overhead() + 1024);
+    std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> buffer(nullptr, ggml_backend_buffer_free);
+    gliner::BoundaryFeatures f = {};
+    if (!starts.empty() || record_options) {
+        std::vector<ggml_tensor *> saved;
+        for (auto * tensor : features.tensors()) saved.push_back(ggml_dup_tensor(retained.value, tensor));
+        buffer.reset(ggml_backend_alloc_ctx_tensors(retained.value, state->backend));
+        if (!buffer) { set_error("Cannot retain boundary extraction features"); return GLINER_STATUS_BACKEND_ERROR; }
+        const auto original = features.tensors();
+        for (size_t i = 0; i < saved.size(); ++i) ggml_backend_tensor_copy(original[i], saved[i]);
+        f = {saved[0], saved[1], saved[2], saved[3], saved[4], saved[5], saved[6], saved[7], saved[8]};
+    }
+    if (!starts.empty()) {
+        const size_t capacity = 1024;
+        GraphContext eval(2 * capacity * ggml_tensor_overhead() + ggml_graph_overhead_custom(capacity, false));
+        const int64_t c = static_cast<int64_t>(starts.size());
+        auto * start_ids = ggml_new_tensor_1d(eval.value, GGML_TYPE_I32, c);
+        auto * end_ids = ggml_new_tensor_1d(eval.value, GGML_TYPE_I32, c);
+        auto * span_lengths = ggml_new_tensor_2d(eval.value, GGML_TYPE_F32, 1, c);
+        auto * length_feats = ggml_new_tensor_2d(eval.value, GGML_TYPE_F32, 3, c);
+        for (auto * input : {start_ids, end_ids, span_lengths, length_feats}) ggml_set_input(input);
+        ggml_tensor * prior = nullptr;
+        auto * output = head.score(eval.value, f, start_ids, end_ids, span_lengths, length_feats, prior);
+        auto * head_graph = ggml_new_graph_custom(eval.value, capacity, false);
+        ggml_set_output(output); ggml_set_output(prior);
+        ggml_build_forward_expand(head_graph, output);
+        if (!allocate_graph(state, head_graph)) return GLINER_STATUS_BACKEND_ERROR;
+        ggml_backend_tensor_set(start_ids, starts.data(), 0, starts.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(end_ids, ends.data(), 0, ends.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(span_lengths, lengths.data(), 0, lengths.size() * sizeof(float));
+        ggml_backend_tensor_set(length_feats, length_features.data(), 0, length_features.size() * sizeof(float));
+        if (!compute(state, head_graph, options.n_threads)) return GLINER_STATUS_BACKEND_ERROR;
+        logits = download_finite(output);
+        compatibility = download_finite(prior);
+    }
+    const size_t candidates = starts.size();
+    std::vector<float> proposals(candidates);
+    for (size_t i = 0; i < candidates; ++i) {
+        proposals[i] = (compatibility[i] + union_start[starts[i]]) + union_end[ends[i]];
+        if (!std::isfinite(proposals[i])) throw std::runtime_error("Model produced nonfinite boundary proposals");
+    }
+    struct PoolEntry { int32_t index; int key; float priority; bool keep; };
+    std::vector<PoolEntry> entries;
+    auto add_entry = [&](int32_t i, float priority) {
+        entries.push_back({i, i < 0 ? boundaries * boundaries : starts[i] * boundaries + ends[i],
+                           i < 0 ? -10000.f : priority, i >= 0});
+    };
+    const size_t quota = std::min(static_cast<size_t>(head.quota), pairs.size());
+    for (int label = 0; label < labels && quota; ++label) {
+        auto ranked = pairs;
+        const size_t base = static_cast<size_t>(label) * boundaries;
+        auto score = [&](int32_t i) {
+            if (i < 0) return -10000.f;
+            const float result = (start_logits[base + starts[i]] + end_logits[base + ends[i]]) + compatibility[i];
+            if (!std::isfinite(result)) throw std::runtime_error("Model produced nonfinite boundary quota scores");
+            return result;
+        };
+        std::stable_sort(ranked.begin(), ranked.end(), [&](int32_t a, int32_t b) { return score(a) > score(b); });
+        for (size_t rank = 0; rank < quota; ++rank) add_entry(ranked[rank], 5000.f + static_cast<float>(quota - rank));
+    }
+    for (int32_t i : pairs) add_entry(i, i < 0 ? -10000.f : proposals[i]);
+    // Keep masked entries through ranking: upstream's -10000 mask can outrank valid scores.
+    auto by_priority = [](const PoolEntry & a, const PoolEntry & b) { return a.priority > b.priority; };
+    std::stable_sort(entries.begin(), entries.end(), by_priority);
+    std::stable_sort(entries.begin(), entries.end(), [](const PoolEntry & a, const PoolEntry & b) { return a.key < b.key; });
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (i && entries[i].key == entries[i - 1].key) entries[i].keep = false;
+        if (!entries[i].keep) entries[i].priority = -10000.f;
+    }
+    std::stable_sort(entries.begin(), entries.end(), by_priority);
+    entries.resize(std::min(entries.size(), static_cast<size_t>(head.pool_size)));
+    std::vector<size_t> order;
+    for (const auto & entry : entries) {
+        if (entry.keep) order.push_back(static_cast<size_t>(entry.index));
+    }
+    std::vector<int32_t> selected_starts, selected_ends;
+    for (size_t i : order) {
+        selected_starts.push_back(starts[i]); selected_ends.push_back(ends[i] - 1);
+        state->boundary_proposals.push_back(proposals[i]);
+    }
+    for (int label = 0; label < labels; ++label) {
+        for (size_t i : order) state->span_logits.push_back(logits[static_cast<size_t>(label) * candidates + i]);
+        if (record_options || sigmoid(null_logits[label]) > head.abstention_threshold || order.empty()) continue;
+        const auto selected = select_spans(tokens, selected_starts, selected_ends,
+            state->span_logits.data() + static_cast<size_t>(label) * order.size(), label, options.threshold,
+            options.allow_overlap != 0, options.max_spans_per_label, true, head.temperature);
+        state->spans.insert(state->spans.end(), selected.begin(), selected.end());
+    }
+    const auto mode = record_options && record_options->mode == GLINER_RECORD_LATENT ? GLINER_RECORD_LATENT : GLINER_RECORD_ANCHORLESS;
+    if (record_options) {
+        if (mode == GLINER_RECORD_ANCHORLESS || !order.empty()) {
+            const size_t capacity = 512;
+            GraphContext eval(2 * capacity * ggml_tensor_overhead() + ggml_graph_overhead_custom(capacity, false));
+            auto * start_ids = order.empty() ? nullptr : ggml_new_tensor_1d(eval.value, GGML_TYPE_I32, static_cast<int64_t>(order.size()));
+            auto * end_ids = order.empty() ? nullptr : ggml_new_tensor_1d(eval.value, GGML_TYPE_I32, static_cast<int64_t>(order.size()));
+            if (start_ids) { ggml_set_input(start_ids); ggml_set_input(end_ids); }
+            ggml_tensor * objects = nullptr;
+            auto * assignments = ctx->boundary_record_head->build(eval.value, f, start_ids, end_ids, mode, objects);
+            ggml_set_output(objects); ggml_set_output(assignments);
+            auto * record_graph = ggml_new_graph_custom(eval.value, capacity, false);
+            ggml_build_forward_expand(record_graph, objects);
+            ggml_build_forward_expand(record_graph, assignments);
+            if (!allocate_graph(state, record_graph)) return GLINER_STATUS_BACKEND_ERROR;
+            if (start_ids) {
+                auto exclusive_ends = selected_ends;
+                for (auto & end : exclusive_ends) ++end;
+                ggml_backend_tensor_set(start_ids, selected_starts.data(), 0, selected_starts.size() * sizeof(int32_t));
+                ggml_backend_tensor_set(end_ids, exclusive_ends.data(), 0, exclusive_ends.size() * sizeof(int32_t));
+            }
+            if (!compute(state, record_graph, options.n_threads)) return GLINER_STATUS_BACKEND_ERROR;
+            state->record_objects = download_finite(objects);
+            state->record_assignments = download_finite(assignments);
+        }
+        decode_boundary_records(ctx, state, record_fields, *record_options, tokens, selected_starts, selected_ends);
+    }
+    auto & result_spans = record_options ? state->record_spans : state->spans;
+    state->span_texts.reserve(result_spans.size());
+    for (auto & span : result_spans) {
+        state->span_texts.push_back(source.substr(span.start, span.end - span.start));
+        span.text = state->span_texts.back().c_str();
+    }
+    tokens.tasks.clear();
+    state->tokens = std::move(tokens);
+    state->span_starts = std::move(selected_starts); state->span_ends = std::move(selected_ends);
+    for (auto & end : state->span_ends) ++end;
+    state->boundary_start = start_logits; state->boundary_end = end_logits; state->boundary_null = null_logits;
+    if (record_options) {
+        state->boundary_record_scores = {labels, words, static_cast<int>(order.size()), static_cast<int>(state->record_objects.size()),
+            mode, ctx->boundary_record_head->temperature, state->tokens.markers.data(), state->tokens.word_positions.data(),
+            state->span_starts.data(), state->span_ends.data(), state->span_logits.data(),
+            state->record_objects.data(), state->record_assignments.data()};
+    } else state->boundary_scores = {labels, words, static_cast<int>(order.size()), head.pool_size, head.temperature, head.abstention_threshold,
+        state->tokens.markers.data(), state->tokens.word_positions.data(), state->span_starts.data(), state->span_ends.data(),
+        state->span_logits.data(), state->boundary_proposals.data(), state->boundary_start.data(), state->boundary_end.data(),
+        state->boundary_null.data()};
+    return GLINER_STATUS_OK;
 }
 
 } // namespace
@@ -454,7 +779,8 @@ int gliner_model_hidden_size(const struct gliner_context * ctx) { return ctx ? c
 int gliner_model_n_tensors(const struct gliner_context * ctx) { return ctx ? ctx->tensors : 0; }
 int gliner_model_n_layers(const struct gliner_context * ctx) { return ctx ? ctx->layers : 0; }
 int gliner_model_supports_text(const struct gliner_context * ctx) { return ctx && ctx->encoder ? 1 : 0; }
-int gliner_model_supports_spans(const struct gliner_context * ctx) { return ctx && ctx->span_head ? 1 : 0; }
+int gliner_model_supports_spans(const struct gliner_context * ctx) { return ctx && (ctx->span_head || ctx->boundary_head) ? 1 : 0; }
+int gliner_model_supports_records(const struct gliner_context * ctx) { return ctx && (ctx->span_head || ctx->boundary_record_head) ? 1 : 0; }
 const char * gliner_model_architecture(const struct gliner_context * ctx) { return ctx ? ctx->architecture.c_str() : nullptr; }
 const char * gliner_model_backend_name(const struct gliner_context * ctx) {
     return ctx ? GLINER_COMPILED_BACKEND : nullptr;
@@ -623,8 +949,8 @@ int gliner_extract_spans(const struct gliner_context * ctx, struct gliner_state 
         set_error("Invalid span extraction arguments");
         return GLINER_STATUS_INVALID_ARGUMENT;
     }
-    if (!ctx->span_head) {
-        set_error(ctx->architecture == "boundary" ? "Boundary span extraction is not implemented; this model supports classification only" :
+    if (!ctx->span_head && !ctx->boundary_head) {
+        set_error(ctx->architecture == "boundary" ? "Boundary span metadata is missing; reconvert this checkpoint to enable extraction" :
                   "Model has no supported span metadata; reconvert a markerV0/count_lstm checkpoint");
         return GLINER_STATUS_MODEL_ERROR;
     }
@@ -637,6 +963,11 @@ int gliner_extract_spans(const struct gliner_context * ctx, struct gliner_state 
             schema.labels.emplace_back(labels[i].name);
             if (labels[i].description) schema.descriptions.emplace_back(labels[i].description);
             else schema.descriptions.emplace_back(std::nullopt);
+        }
+        if (ctx->boundary_head) {
+            const int result = extract_boundary(ctx, state, source, schema, options);
+            if (result != GLINER_STATUS_OK) state->clear();
+            return result;
         }
         auto tokens = ctx->tokenizer->encode(source, {schema}, options.max_words, options.max_tokens, gliner::SchemaKind::Entities);
         const int n_words = static_cast<int>(tokens.words.size());
@@ -709,7 +1040,7 @@ int gliner_extract_spans(const struct gliner_context * ctx, struct gliner_state 
 }
 
 struct gliner_record_params gliner_default_record_params(void) {
-    return {1, 512, 0, 0.5f, 19, 0, 0};
+    return {1, 512, 0, 0.5f, 19, 0, 0, GLINER_RECORD_AUTO};
 }
 
 int gliner_extract_records(const struct gliner_context * ctx, struct gliner_state * state,
@@ -721,15 +1052,17 @@ int gliner_extract_records(const struct gliner_context * ctx, struct gliner_stat
     const auto options = params ? *params : gliner_default_record_params();
     if (!ctx || !state || state->owner != ctx || !text || !structure || !*structure || !fields ||
         n_fields <= 0 || options.n_threads <= 0 || options.max_tokens <= 0 || options.max_tokens > 4096 ||
-        n_fields > options.max_tokens || options.max_words < 0 || options.max_records < 1 || options.max_records > 19 ||
+        n_fields > options.max_tokens || options.max_words < 0 || options.max_records < 1 || options.max_records > 4096 ||
+        (ctx && ctx->architecture == "span" && (options.max_records > 19 || options.mode != GLINER_RECORD_AUTO)) ||
+        (options.mode != GLINER_RECORD_AUTO && options.mode != GLINER_RECORD_ANCHORLESS && options.mode != GLINER_RECORD_LATENT) ||
         options.max_spans_per_field < 0 || (options.allow_overlap != 0 && options.allow_overlap != 1) ||
         !std::isfinite(options.threshold) || options.threshold < 0 || options.threshold > 1 ||
         std::strcmp(structure, "entities") == 0) {
-        set_error("Invalid structured extraction arguments (max_records must be 1..19; 'entities' is reserved)");
+        set_error("Invalid structured extraction arguments (span: auto mode and max_records 1..19; boundary: max_records 1..4096; 'entities' is reserved)");
         return GLINER_STATUS_INVALID_ARGUMENT;
     }
-    if (!ctx->span_head) {
-        set_error(ctx->architecture == "boundary" ? "Boundary record extraction is not implemented; this model supports classification only" :
+    if (!ctx->span_head && !ctx->boundary_record_head) {
+        set_error(ctx->architecture == "boundary" ? "Boundary record metadata is missing; reconvert a checkpoint with enable_records" :
                   "Model has no supported span metadata; reconvert a markerV0/count_lstm checkpoint");
         return GLINER_STATUS_MODEL_ERROR;
     }
@@ -744,6 +1077,13 @@ int gliner_extract_records(const struct gliner_context * ctx, struct gliner_stat
             schema.labels.emplace_back(fields[i].name);
             if (fields[i].description) schema.descriptions.emplace_back(fields[i].description);
             else schema.descriptions.emplace_back(std::nullopt);
+        }
+        if (ctx->boundary_record_head) {
+            const gliner_span_params common = {options.n_threads, options.max_tokens, options.max_words, options.threshold,
+                                               options.max_spans_per_field, options.allow_overlap};
+            const int status = extract_boundary(ctx, state, source, schema, common, fields, &options);
+            if (status != GLINER_STATUS_OK) state->clear();
+            return status;
         }
         auto tokens = ctx->tokenizer->encode(source, {schema}, options.max_words, options.max_tokens, gliner::SchemaKind::Records);
         const int n_words = static_cast<int>(tokens.words.size());
@@ -865,6 +1205,9 @@ const struct gliner_span * gliner_get_record_spans(const struct gliner_state * s
 const struct gliner_record_scores * gliner_get_record_scores(const struct gliner_state * state) {
     return state && state->record_scores.n_fields > 0 ? &state->record_scores : nullptr;
 }
+const struct gliner_boundary_record_scores * gliner_get_boundary_record_scores(const struct gliner_state * state) {
+    return state && state->boundary_record_scores.n_fields > 0 ? &state->boundary_record_scores : nullptr;
+}
 
 int gliner_n_spans(const struct gliner_state * state) {
     return state ? static_cast<int>(state->spans.size()) : 0;
@@ -874,6 +1217,9 @@ const struct gliner_span * gliner_get_spans(const struct gliner_state * state) {
 }
 const struct gliner_span_scores * gliner_get_span_scores(const struct gliner_state * state) {
     return state && state->span_scores.n_labels > 0 ? &state->span_scores : nullptr;
+}
+const struct gliner_boundary_scores * gliner_get_boundary_scores(const struct gliner_state * state) {
+    return state && state->boundary_scores.n_labels > 0 ? &state->boundary_scores : nullptr;
 }
 
 int gliner_n_tasks(const struct gliner_state * state) {
