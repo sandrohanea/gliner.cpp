@@ -125,7 +125,10 @@ def prepare_device(torch, specification):
     device = torch.device(specification)
     if device.type == "cuda":
         if torch.version.cuda is None:
-            raise RuntimeError("This PyTorch installation is CPU-only. Install a CUDA-enabled PyTorch wheel in this environment.")
+            raise RuntimeError(
+                f"PyTorch {torch.__version__} in {sys.executable} is CPU-only. "
+                "Install a CUDA-enabled PyTorch wheel using this interpreter's -m pip, "
+                "or run the benchmark with your CUDA environment's python.exe.")
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA was requested but PyTorch cannot access a CUDA device; check the NVIDIA driver and GPU visibility.")
         index = 0 if device.index is None else device.index

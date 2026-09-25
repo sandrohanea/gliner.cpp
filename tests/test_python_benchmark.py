@@ -109,6 +109,7 @@ class PythonBenchmarkTests(unittest.TestCase):
 
     def test_cuda_precision_and_no_fallback(self):
         torch = MagicMock()
+        torch.__version__ = "2.6.0+cpu"
         torch.device.side_effect = FakeDevice
         torch.version.cuda = "12.6"
         torch.cuda.is_available.return_value = True
@@ -126,8 +127,10 @@ class PythonBenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "cannot access a CUDA device"):
             prepare_device(torch, "cuda")
         torch.version.cuda = None
-        with self.assertRaisesRegex(RuntimeError, "CPU-only"):
+        with self.assertRaisesRegex(RuntimeError, "CPU-only") as error:
             prepare_device(torch, "cuda")
+        self.assertIn(sys.executable, str(error.exception))
+        self.assertIn("2.6.0+cpu", str(error.exception))
         torch.reset_mock()
         self.assertEqual(prepare_device(torch, "cpu").type, "cpu")
         torch.cuda.set_device.assert_not_called()

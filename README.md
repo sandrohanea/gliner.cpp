@@ -172,7 +172,7 @@ This is one document with multiple questions, not a padded batch of multiple doc
 
 ## Performance benchmark
 
-`gliner-bench` is built alongside `gliner-classify` and uses the same synchronous C API for **CPU, CUDA and Metal**, selected at build time. It loads the model once, reads the text once and reuses execution states. CPU execution has been exercised with the real F32 checkpoint; the user has also supplied an RTX 4060 Laptop CUDA run for the two-question workload below.
+`gliner-bench` is built alongside `gliner-classify` and uses the same synchronous C API for **CPU, CUDA and Metal**, selected at build time. It loads the model once, reads the text once and reuses execution states. Published device measurements are collected in [Benchmark results](docs/benchmarks/README.md), including the [Windows CPU/CUDA and Python comparison](docs/benchmarks/2026-09-25-windows-rtx4060.md).
 
 Start with a Release CPU build:
 
@@ -220,14 +220,7 @@ Joint mode uses one state. Separate mode reuses one state per question to avoid 
 
 The benchmark does **not** yet sample peak RAM/VRAM, measure concurrent-request serving, generate token-length sweeps or compare result files automatically. `model_file_bytes` is file size, not resident or peak memory. Use external memory monitoring and explicit input files for short/medium/long workloads. Keep CPU/GPU precision settings consistent before interpreting speedups.
 
-For the user-reported Windows workload `"Please refund my order; the delivery was late."`, tasks `intent` (`refund_request,order_status,other`) and `sentiment` (`positive,neutral,negative`), F32 weights, 4 CPU threads, 3 warmups and 20 measured requests per mode:
-
-| Mode | C++ CPU mean / p95 | C++ CUDA mean / p95 | Mean-latency speedup |
-|---|---|---|---|
-| Joint (40 tokens) | 503.62 / 510.87 ms | 35.55 / 37.23 ms | 14.17x |
-| Separate (27 + 23 tokens) | 901.80 / 986.00 ms | 54.92 / 55.60 ms | 16.42x |
-
-The RTX 4060 Laptop CUDA run used both strict precision environment settings and the MMF source fix. Model loading was 2.16 s on CPU and 4.04 s on CUDA, outside the warm timings. These are user-supplied measurements for one repeated input, not general hardware performance guarantees; the CPU model, power/thermal state and background load were not recorded with these reports.
+The [dated Windows report](docs/benchmarks/2026-09-25-windows-rtx4060.md) contains the exact two-question workload, all eight CPU/CUDA/Python mode results, loading/first-request timings, correctness evidence, reproduction commands and comparison caveats. Keep new device results in separate reports so Metal measurements can be published independently.
 
 ### Optional Python CPU/CUDA comparison
 
@@ -275,14 +268,21 @@ For Python CUDA, first check your environment:
 .\build-oracle\Scripts\python.exe -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 ```
 
-If it is CPU-only, use a separate environment to preserve the existing CPU baseline. The [official PyTorch 2.6.0 CUDA 12.6 wheel](https://pytorch.org/get-started/previous-versions/) is available for Windows/Python 3.12:
+If it is CPU-only, use a separate environment to preserve the existing CPU baseline. In the user's restricted environment, use the approved package index `https://packagefeedproxy.microsoft.io/pypi/simple/`, not the blocked external PyTorch registry.
+
+**CUDA wheel availability:** when checked on 2026-09-25, the proxy listed `torch-2.6.0-cp312-cp312-win_amd64.whl` but no CUDA-tagged PyTorch wheels, including `2.6.0+cu126`. The plain version is not proof of CUDA support. An approved feed must mirror the CUDA wheel (or supply an approved local wheel) before the CUDA install below can succeed; otherwise pip should fail rather than substitute the CPU build.
 
 ```powershell
 py -3.12 -m venv build-oracle-cuda
-.\build-oracle-cuda\Scripts\python.exe -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu126
-.\build-oracle-cuda\Scripts\python.exe -m pip install -r .\tests\requirements-parity.txt
-.\build-oracle-cuda\Scripts\python.exe -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+# Requires torch 2.6.0+cu126 to have been mirrored into the approved feed.
+.\build-oracle-cuda\Scripts\python.exe -m pip install --upgrade "torch==2.6.0+cu126" `
+  --index-url https://packagefeedproxy.microsoft.io/pypi/simple/
+.\build-oracle-cuda\Scripts\python.exe -m pip install -r .\tests\requirements-parity.txt `
+  --index-url https://packagefeedproxy.microsoft.io/pypi/simple/
+.\build-oracle-cuda\Scripts\python.exe -c "import sys, torch; print(sys.executable); print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 ```
+
+The explicit `+cu126` suffix matters when repairing an existing environment: `torch==2.6.0` alone can already be satisfied by `2.6.0+cpu`. Expect `2.6.0+cu126`, `12.6`, and `True` from the check, and use that same interpreter for the benchmark. A `+cpu` version with `torch.version.cuda == None` means the wrong wheel or interpreter, not a failed C++ CUDA build. The parity requirements accept the CUDA wheel and do not require replacing it with the CPU build. Do not add the blocked registry as an extra index to work around its unavailability.
 
 The wheel supplies its CUDA runtime (12.6 here); it need not match the locally installed `nvcc` toolkit used to compile GGML. The NVIDIA driver must support it. The benchmark records PyTorch's CUDA runtime, GPU name, compute capability and precision settings so that this stack difference is visible.
 
@@ -298,7 +298,7 @@ $env:GGML_CUDA_CUBLAS_COMPUTE_TYPE = "f32"
   > .\build-oracle-cuda\bench-python-cuda.json
 ```
 
-Use `build-oracle` instead if it already has a working CUDA-enabled PyTorch. The Python CUDA path explicitly selects PyTorch's highest F32 matmul precision and disables TF32 for matmul and cuDNN; keep the environment settings above for the C++ comparison. It does not mutate the invoking shell's environment. Compare CUDA against CUDA, including token counts and last logits, and run the programs sequentially. Python CUDA execution has not been validated on this CPU-only development host; the GPU timing/transfer policy has unit coverage and awaits a hardware run.
+Use `build-oracle` instead if it already has a working CUDA-enabled PyTorch. The Python CUDA path explicitly selects PyTorch's highest F32 matmul precision and disables TF32 for matmul and cuDNN; keep the environment settings above for the C++ comparison. It does not mutate the invoking shell's environment. Compare CUDA against CUDA, including token counts and last logits, and run the programs sequentially. Python CUDA has unit coverage for timing/transfers plus the [user-supplied RTX 4060 hardware benchmark](docs/benchmarks/2026-09-25-windows-rtx4060.md); this development host itself remains CPU-only.
 
 Standard-library parser/timing tests run in CTest without ML dependencies. The optional live Python/C++ comparison can be run with:
 
@@ -323,7 +323,7 @@ The normal CTest suite needs no ML dependencies or downloaded weights. It replay
 For the optional live oracle, use a separate Python 3.12 environment:
 
 ```sh
-python -m pip install -r tests/requirements-parity.txt
+python -m pip install -r tests/requirements-parity.txt --index-url https://packagefeedproxy.microsoft.io/pypi/simple/
 python tests/test_parity.py --checkpoint models/GLiNER2.5-Decide \
   --gguf models/decide.gguf --binary build/gliner-classify
 ```
