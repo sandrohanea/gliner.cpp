@@ -2,6 +2,8 @@
 
 Reports contain measurements supplied from the named device, not performance guarantees or cross-device rankings. Benchmark usage and timing definitions are in the [main README](../../README.md#performance-benchmark).
 
+The temporary Python comparison harness is no longer maintained in the current tree. For historical reproduction, it is preserved in [revision 647ad73](https://github.com/sandrohanea/gliner.cpp/tree/647ad73) as [tests/bench_python.py](https://github.com/sandrohanea/gliner.cpp/blob/647ad73/tests/bench_python.py). Its removal does not change the recorded measurements. Use the native `gliner-bench` for ongoing benchmarking.
+
 | Date | Platform | Comparisons |
 |---|---|---|
 | 2026-09-25 | [Windows / Core i7-13800H / RTX 4060 Laptop](2026-09-25-windows-rtx4060.md) | C++ and Python, CPU and CUDA, joint and separate questions |

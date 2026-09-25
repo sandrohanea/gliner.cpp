@@ -4,9 +4,11 @@ GGML/GGUF inference for [fastino/GLiNER2.5-Decide](https://huggingface.co/fastin
 
 Despite its name, the published checkpoint uses the **span** architecture. Its classification head is `Linear(H, 2H)`, ReLU, `Linear(2H, 1)` on contextual marker states, not standalone label embeddings.
 
+**No Python is needed to build or run the C++ library, CLI or benchmark from a GGUF model.** Python is limited to one-time Hugging Face conversion and optional developer tests/reference checks.
+
 ## Build
 
-Requires CMake 3.20+, a C++17 compiler, GGML and utf8proc. Missing dependencies are fetched at pinned revisions: GGML v0.24.0 and utf8proc v2.10.0. Python 3.10+ is needed only for conversion and the synthetic tests.
+Requires CMake 3.20+, a C++17 compiler, GGML and utf8proc. Missing dependencies are fetched at pinned revisions: GGML v0.24.0 and utf8proc v2.10.0. Python 3.10+ is optional for synthetic integration tests and required only when running the converter.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -15,6 +17,8 @@ ctest --test-dir build -C Release --output-on-failure
 ```
 
 On Windows with Visual Studio, the executable is `build\Release\gliner-classify.exe`. With a single-configuration generator it is `build/gliner-classify`. Fetched dependency DLLs are placed alongside the executable on Windows.
+
+The C API checks and CUDA/Metal source-overlay checks run natively. CMake also registers standard-library-only conversion/CLI tests when Python is available; pass `-DGLINER_PYTHON_TESTS=OFF` to disable Python test discovery entirely. This reduces test coverage, not runtime functionality. See [Testing and upstream parity](docs/testing.md).
 
 GGML resolution is: a local `ggml/` checkout (or `-DGLINER_GGML_SOURCE_DIR=...`), an installed GGML CMake package, installed libraries, then the pinned fetch fallback. For installed dependencies:
 
@@ -102,15 +106,14 @@ This option removes both the Metal dispatch overlay and the graph's F32 matrix p
 
 ## Convert
 
-Download the model repository into a local directory containing `config.json`, `encoder_config/config.json`, `tokenizer.json`, and `model.safetensors` (or sharded safetensors and its index):
+Download the [model repository](https://huggingface.co/fastino/GLiNER2.5-Decide/tree/7ee5da4c2415e32259bcdc0b1a7367c32ce8d6f6) with your preferred client into a local directory containing `config.json`, `encoder_config/config.json`, `tokenizer.json`, and `model.safetensors` (or sharded safetensors and its index):
 
 ```sh
-python -c 'from huggingface_hub import snapshot_download; snapshot_download(repo_id="fastino/GLiNER2.5-Decide", revision="7ee5da4c2415e32259bcdc0b1a7367c32ce8d6f6", local_dir="models/GLiNER2.5-Decide", allow_patterns=["config.json", "encoder_config/config.json", "tokenizer.json", "model.safetensors", "model.safetensors.index.json"])'
 python convert/convert_hf_to_gguf.py models/GLiNER2.5-Decide models/decide.gguf
 build/gliner-classify --model models/decide.gguf --inspect
 ```
 
-The download command requires `huggingface_hub`; conversion itself has no Python package dependencies. Checkpoints and GGUF outputs are ignored by Git.
+Conversion has no Python package dependencies. Once converted, distribute/use the GGUF with the native runtime; no checkpoint directory or Python environment is needed for inference. Checkpoints and GGUF outputs are ignored by Git.
 
 The converter is streaming and **standard-library-only**. It preserves every F32/F16 tensor, including unused span/counting weights, without quantization. It validates tensor shapes, dtypes, offsets, shard indexes, required encoder/classifier tensors and the supported tokenizer/encoder configuration. GGUF v3 contains application format version 2, including exact Unigram scores and Python Unicode lowercasing/word-character tables.
 
@@ -235,95 +238,9 @@ The benchmark does **not** yet sample peak RAM/VRAM, measure concurrent-request 
 
 The [dated Windows report](docs/benchmarks/2026-09-25-windows-rtx4060.md) and [M4 Pro report](docs/benchmarks/2026-09-25-macos-m4-pro.md) contain the exact two-question workload, results, loading/first-request timings, correctness evidence, reproduction commands and comparison caveats.
 
-### Optional Python CPU/CUDA comparison
+The exploratory Python performance harness has been removed from the current tree. Its recorded results, methodology and links to the historical harness remain in the [device reports](docs/benchmarks/README.md). Use the native `gliner-bench` for ongoing performance work.
 
-`tests/bench_python.py` is an optional comparison helper using the existing `tests/requirements-parity.txt` environment. It reuses the upstream processor, Transformers encoder and classification head from the parity loader, once, in **float32 eval/inference mode**. The default is CPU; the Python-only `--device cuda` or `--device cuda:N` selects a CUDA GPU and fails explicitly if unavailable, without falling back to CPU. It accepts the same text, task, prompt, description, thread/limit, mode, warmup and iteration options as `gliner-bench`; supply the local Hugging Face directory with `--checkpoint` instead of a GGUF with `--model`. This does not change the C++ runtime's build-time backend selection.
-
-Run on the **same machine**, with other benchmarks/builds stopped:
-
-```powershell
-$workload = @(
-  "--text", "Please refund my order; the delivery was late.",
-  "--task", "intent", "--labels", "refund_request,order_status,other",
-  "--task", "sentiment", "--labels", "positive,neutral,negative",
-  "--threads", "4", "--mode", "both", "--warmup", "3", "--iterations", "20"
-)
-.\build-cpu\Release\gliner-bench.exe --model .\models\decide.gguf @workload `
-  > .\build-cpu\bench-cpu-comparison.json
-.\build-oracle\Scripts\python.exe .\tests\bench_python.py `
-  --checkpoint .\models\GLiNER2.5-Decide @workload `
-  > .\build-oracle\bench-python-cpu.json
-
-$cpp = Get-Content .\build-cpu\bench-cpu-comparison.json -Raw | ConvertFrom-Json
-$python = Get-Content .\build-oracle\bench-python-cpu.json -Raw | ConvertFrom-Json
-foreach ($row in $python.results) {
-  $baseline = $cpp.results | Where-Object mode -eq $row.mode
-  [pscustomobject]@{
-    Mode = $row.mode
-    CppMeanMs = $baseline.latency_ms.mean
-    PythonMeanMs = $row.latency_ms.mean
-    CppSpeedup = $row.latency_ms.mean / $baseline.latency_ms.mean
-  }
-}
-```
-
-Use a C++ result file from those exact arguments: token counts should be `[40]` for joint and `[27,23]` for separate, and each mode's `last_logits` should agree within the established F32 tolerance. `CppSpeedup` above 1 means C++ was faster. Different computers or different task/text configurations are not comparable.
-
-The Python request timer includes collation/tokenization, input transfers, encoder execution, upstream marker extraction, per-task classification and materialization of logits/sigmoid probabilities on the host. It excludes imports, model loading, initial schema construction, result validation and JSON formatting. CUDA runs synchronize the selected device before starting and before stopping each timer; warmups are also synchronized. Model weights move to the GPU once during loading, not per request. Like C++, it reports the first request separately, then runs additional warmups followed by measured samples, using the same median/p95 definition and per-request throughput formulas. Each request answers all questions; separate mode uses multiple encoder passes without reloading the model. No per-layer outputs, autocast, tracing or compilation are enabled.
-
-Python sets PyTorch intra-op threads to `--threads` and inter-op threads to 1; the JSON records the effective counts, package versions and PyTorch build configuration. Upstream's normal per-segment tokenizer cache remains active across requests and modes (C++ currently has no equivalent cache). There is no explicit Python state allocator: `state_count` is 0 and `state_init_ms` is null rather than claiming equivalence to C++ state initialization.
-
-**Compare steady-state inference, not loader timings, across implementations.** This helper loads only the upstream classification components, not unused span/counting modules or the full `AutoExtractor` facade. Safetensors can map weights lazily, whereas GGUF loading copies the required weights; imports and first-use page faults also fall in different phases. CUDA model loading includes device initialization and synchronized weight transfers. `model_load_ms` therefore does not measure equivalent full-application startup costs. Peak memory, Python Metal/MPS benchmarking, reduced-precision modes and a general cross-machine speedup claim are out of scope for this helper.
-
-For Python CUDA, first check your environment:
-
-```powershell
-.\build-oracle\Scripts\python.exe -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
-```
-
-If it is CPU-only, use a separate environment to preserve the existing CPU baseline. In the user's restricted environment, use the approved package index `https://packagefeedproxy.microsoft.io/pypi/simple/`, not the blocked external PyTorch registry.
-
-**CUDA wheel availability:** when checked on 2026-09-25, the proxy listed `torch-2.6.0-cp312-cp312-win_amd64.whl` but no CUDA-tagged PyTorch wheels, including `2.6.0+cu126`. The plain version is not proof of CUDA support. An approved feed must mirror the CUDA wheel (or supply an approved local wheel) before the CUDA install below can succeed; otherwise pip should fail rather than substitute the CPU build.
-
-```powershell
-py -3.12 -m venv build-oracle-cuda
-# Requires torch 2.6.0+cu126 to have been mirrored into the approved feed.
-.\build-oracle-cuda\Scripts\python.exe -m pip install --upgrade "torch==2.6.0+cu126" `
-  --index-url https://packagefeedproxy.microsoft.io/pypi/simple/
-.\build-oracle-cuda\Scripts\python.exe -m pip install -r .\tests\requirements-parity.txt `
-  --index-url https://packagefeedproxy.microsoft.io/pypi/simple/
-.\build-oracle-cuda\Scripts\python.exe -c "import sys, torch; print(sys.executable); print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
-```
-
-The explicit `+cu126` suffix matters when repairing an existing environment: `torch==2.6.0` alone can already be satisfied by `2.6.0+cpu`. Expect `2.6.0+cu126`, `12.6`, and `True` from the check, and use that same interpreter for the benchmark. A `+cpu` version with `torch.version.cuda == None` means the wrong wheel or interpreter, not a failed C++ CUDA build. The parity requirements accept the CUDA wheel and do not require replacing it with the CPU build. Do not add the blocked registry as an extra index to work around its unavailability.
-
-The wheel supplies its CUDA runtime (12.6 here); it need not match the locally installed `nvcc` toolkit used to compile GGML. The NVIDIA driver must support it. The benchmark records PyTorch's CUDA runtime, GPU name, compute capability and precision settings so that this stack difference is visible.
-
-Using the same `$workload` array from the CPU example:
-
-```powershell
-$env:NVIDIA_TF32_OVERRIDE = "0"
-$env:GGML_CUDA_CUBLAS_COMPUTE_TYPE = "f32"
-.\build-cuda\Release\gliner-bench.exe --model .\models\decide.gguf @workload `
-  > .\build-cuda\bench-cuda-comparison.json
-.\build-oracle-cuda\Scripts\python.exe .\tests\bench_python.py `
-  --checkpoint .\models\GLiNER2.5-Decide --device cuda @workload `
-  > .\build-oracle-cuda\bench-python-cuda.json
-```
-
-Use `build-oracle` instead if it already has a working CUDA-enabled PyTorch. The Python CUDA path explicitly selects PyTorch's highest F32 matmul precision and disables TF32 for matmul and cuDNN; keep the environment settings above for the C++ comparison. It does not mutate the invoking shell's environment. Compare CUDA against CUDA, including token counts and last logits, and run the programs sequentially. Python CUDA has unit coverage for timing/transfers plus the [user-supplied RTX 4060 hardware benchmark](docs/benchmarks/2026-09-25-windows-rtx4060.md); this macOS host has no CUDA device.
-
-Standard-library parser/timing tests run in CTest without ML dependencies. The optional live Python/C++ comparison can be run with:
-
-```powershell
-.\build-oracle\Scripts\python.exe .\tests\test_python_benchmark.py `
-  --cpp-bench .\build-cpu\Release\gliner-bench.exe `
-  --converter .\convert\convert_hf_to_gguf.py
-```
-
-On CUDA hardware, the same live comparison accepts `--device cuda` with the CUDA `gliner-bench` and a CUDA-enabled Python environment; it fails rather than skipping when CUDA is unavailable.
-
-## Python parity
+## Validation
 
 Real-checkpoint F32 parity has been exercised against checkpoint revision `7ee5da4c2415e32259bcdc0b1a7367c32ce8d6f6`, upstream GLiNER2 commit `1a80c9c85272cd6809009b102b770c452e928196`, Transformers 4.48.1/4.48.2 and PyTorch 2.6.0. Eight single-task cases cover ordinary and empty text, Unicode, punctuation, URLs/email, prompts/descriptions containing special markers, empty descriptions, word truncation and logarithmic relative-position buckets. Five additional joint-schema cases cover multiple tasks with different label counts, repeated labels across tasks, prefix-overlapping task names, task order, mixed decoding modes and shared text truncation. The current processor/scorer and span inference semantics were also checked at upstream commit `55656fbfa01d3d4a77485e1a1eeeaf682990ccdf`.
 
@@ -331,34 +248,9 @@ Token IDs, marker positions and task score offsets match exactly. All 25 hidden-
 
 The normal CTest suite needs no ML dependencies or downloaded weights. It replays checked-in, deterministic single-task and joint-schema goldens on a complete tiny encoder, checks F32/F16 storage, the C ABI, task grouping/decoding, conversion preservation and error paths. A callback-count assertion verifies one encoder traversal per multi-task call. It also compares file, buffer and non-seekable short-read stream initialization for both single-task and joint inference, including source lifetimes, malformed/truncated input and loader cleanup. Tiny F32 uses `atol=rtol=5e-5`; F16 storage is compared to F32 goldens with `5e-3`. **Real-checkpoint F16 parity has not been established.**
 
-`tiny_cuda_parity.json` adds 32-wide encoder fixtures with 10- and 30-token inputs, covering CUDA's short-matrix dispatch boundary that the original 8-wide fixtures could not exercise. Regenerate them with `tests/test_parity.py --kernel-only --write-golden tests/fixtures/tiny_cuda_parity.json`. CUDA and Metal source-overlay configuration tests check that GGML checkouts remain unchanged; hardware numerical parity is checked separately.
+Native C/CMake checks run without Python. The additional synthetic conversion/CLI suite uses only Python's standard library, not PyTorch. One optional upstream tool, `tests/test_parity.py`, remains for regenerating goldens and comparing real checkpoints; its ML dependencies are never part of the runtime or ordinary build. See [Testing and upstream parity](docs/testing.md) for test layers, fixture regeneration and the explicit real-model check.
 
-For the optional live oracle, use a separate Python 3.12 environment:
-
-```sh
-python -m pip install -r tests/requirements-parity.txt
-python tests/test_parity.py --checkpoint models/GLiNER2.5-Decide \
-  --gguf models/decide.gguf --binary build-metal/gliner-classify \
-  --expect-backend metal
-```
-
-To include that comparison in CTest, configure `GLINER_PARITY_CHECKPOINT` and `GLINER_PARITY_GGUF` with absolute paths and select the oracle environment with `Python3_EXECUTABLE`. The oracle runs all 13 cases by default; `--single-only` and `--batch-only` select a subset. Regenerate synthetic fixtures with `tests/test_parity.py --single-only --write-golden tests/fixtures/tiny_parity.json` or `--batch-only --write-golden tests/fixtures/tiny_batch_parity.json`; provenance is stored inside each fixture.
-
-Parity runs use the binary's compiled backend. Both scripts accept `--expect-backend cpu|cuda|metal` to assert which build is under test; this option does not select or change the backend. CTest supplies that assertion automatically. CUDA CTest runs and standalone parity scripts explicitly set `NVIDIA_TF32_OVERRIDE=0` and `GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32` for their child processes, without changing the invoking shell. CPU/Metal runs leave those environment settings alone.
-
-Keep separate CPU/CUDA/Metal build directories and run CTest in each; a GPU build without its required device fails rather than skipping. The synthetic parity test reports backend, storage dtype, fixture, first failing encoder layer and the numerical error/allowed error. Layer 0 is embeddings. GPU tests enforce the same tolerances as CPU; hardware-specific tolerances must be measured and documented before changing them. The reported CUDA result and measured M4 Pro Metal result establish F32 numerical parity for these fixtures and real-checkpoint cases on those devices. They do not establish real-checkpoint F16 parity or a speedup. Malformed-GGUF messages from negative loader tests are expected; a traceback or CTest failure is not.
-
-For classification-head-only comparisons, export contextual states with the upstream model:
-
-```sh
-python examples/export_label_states.py --checkpoint models/GLiNER2.5-Decide \
-  --text "Please refund my order" --task intent \
-  --labels refund_request order_status other --output label_states.txt
-build/gliner-classify --model models/decide.gguf \
-  --labels refund_request,order_status,other --states label_states.txt
-```
-
-Each states-file row contains `hidden_size` floats for one contextual `[L]` marker, in label order. This legacy path retains sigmoid probabilities by default.
+The `--states` CLI path still accepts precomputed contextual `[L]` states for classification-head-only scoring: one row of `hidden_size` floats per label, in label order. It retains sigmoid probabilities by default.
 
 ## C API
 

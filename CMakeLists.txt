@@ -132,21 +132,35 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+    option(GLINER_PYTHON_TESTS "Run standard-library conversion and CLI integration tests when Python is available" ON)
+    set(GLINER_PARITY_CHECKPOINT "" CACHE PATH "Optional real checkpoint for live Python parity")
+    set(GLINER_PARITY_GGUF "" CACHE FILEPATH "Converted GGUF for live Python parity")
     add_executable(gliner-test tests/test_core.c)
     target_link_libraries(gliner-test PRIVATE gliner)
     set_target_properties(gliner-test PROPERTIES LINKER_LANGUAGE CXX C_STANDARD 11 C_STANDARD_REQUIRED YES C_EXTENSIONS OFF)
     add_test(NAME gliner-core COMMAND gliner-test)
+    foreach(backend IN ITEMS cuda metal)
+        if(backend STREQUAL "cuda")
+            set(precision_module GgmlCudaPrecision.cmake)
+        else()
+            set(precision_module GgmlMetalPrecision.cmake)
+        endif()
+        add_test(NAME gliner-${backend}-precision-config
+            COMMAND "${CMAKE_COMMAND}"
+                "-DBACKEND=${backend}"
+                "-DMODULE=${CMAKE_CURRENT_SOURCE_DIR}/cmake/${precision_module}"
+                "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/tests/precision-${backend}"
+                "-DCXX_COMPILER=${CMAKE_CXX_COMPILER}"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_precision_config.cmake")
+    endforeach()
     set(GLINER_PARITY_TESTS gliner-core)
-    find_package(Python3 COMPONENTS Interpreter)
-    if(Python3_Interpreter_FOUND)
-        add_test(NAME gliner-python-benchmark-unit
-            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_python_benchmark.py")
-        add_test(NAME gliner-cuda-precision-config
-            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cuda_precision_config.py"
-                "${CMAKE_COMMAND}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GgmlCudaPrecision.cmake")
-        add_test(NAME gliner-metal-precision-config
-            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_metal_precision_config.py"
-                "${CMAKE_COMMAND}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GgmlMetalPrecision.cmake")
+    if(GLINER_PYTHON_TESTS)
+        find_package(Python3 3.10 QUIET COMPONENTS Interpreter)
+        if(NOT Python3_Interpreter_FOUND)
+            message(STATUS "Python 3.10+ not found: conversion/CLI integration tests are not registered; native tests remain enabled")
+        endif()
+    endif()
+    if(GLINER_PYTHON_TESTS AND Python3_Interpreter_FOUND)
         set(GLINER_CONVERSION_OPTIONS "")
         set(GLINER_CONVERSION_TEST gliner-conversion)
         if(GLINER_BUILD_METAL AND NOT GLINER_METAL_STRICT_F32)
@@ -171,8 +185,6 @@ if(BUILD_TESTING)
                 --expect-backend "${GLINER_COMPILED_BACKEND}")
         set_tests_properties(gliner-benchmark PROPERTIES LABELS "benchmark;${GLINER_COMPILED_BACKEND}" TIMEOUT 600)
         list(APPEND GLINER_PARITY_TESTS gliner-benchmark)
-        set(GLINER_PARITY_CHECKPOINT "" CACHE PATH "Optional real checkpoint for live Python parity")
-        set(GLINER_PARITY_GGUF "" CACHE FILEPATH "Converted GGUF for live Python parity")
         if(GLINER_PARITY_CHECKPOINT AND GLINER_PARITY_GGUF AND
                 GLINER_BUILD_METAL AND NOT GLINER_METAL_STRICT_F32)
             message(STATUS "gliner: strict real-checkpoint parity is not registered for fast Metal mode")
