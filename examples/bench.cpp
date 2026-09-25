@@ -280,6 +280,7 @@ int gliner_cli_main(const std::vector<std::string> & args) {
         out.imbue(std::locale::classic());
         out << std::setprecision(17)
             << "{\"schema_version\":1,\"backend\":\"" << gliner_model_backend_name(model.get())
+            << "\",\"architecture\":\"" << gliner_model_architecture(model.get())
             << "\",\"device\":\"" << escape_json(gliner_model_device_name(model.get()))
             << "\",\"build_type\":\"" << escape_json(GLINER_BENCH_BUILD_TYPE)
             << "\",\"compiler\":\"" << escape_json(GLINER_BENCH_COMPILER)

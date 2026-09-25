@@ -4,6 +4,8 @@ GGML/GGUF inference for [fastino/GLiNER2.5-Decide](https://huggingface.co/fastin
 
 Despite its name, the published checkpoint uses the **span** architecture. Its classification head is `Linear(H, 2H)`, ReLU, `Linear(2H, 1)` on contextual marker states, not standalone label embeddings.
 
+**Additional GLiNER2.5 models:** base, small, multilingual and multilingual Decide checkpoints now support native classification. All four use the **boundary** architecture; their span/record heads are not implemented yet. See [Model compatibility](docs/models.md) for exact revisions, the feature matrix and CPU parity results.
+
 **No Python is needed to build or run the C++ library, CLI or benchmark from a GGUF model.** Python is limited to one-time Hugging Face conversion and optional developer tests/reference checks.
 
 ## Build
@@ -115,7 +117,7 @@ build/gliner-classify --model models/decide.gguf --inspect
 
 Conversion has no Python package dependencies. Once converted, distribute/use the GGUF with the native runtime; no checkpoint directory or Python environment is needed for inference. Checkpoints and GGUF outputs are ignored by Git.
 
-The converter is streaming and **standard-library-only**. It preserves every F32/F16 tensor without quantization. It validates tensor shapes, dtypes, offsets, shard indexes, required encoder/classifier tensors and the supported tokenizer/encoder configuration. Checkpoints declaring a `markerV0` span head also require complete span, count-gate and `count_lstm` conditioning tensors. GGUF v3 contains application format version 2, including exact Unigram scores, Python Unicode lowercasing/word-character tables and additive span metadata where available.
+The converter is streaming and **standard-library-only**. It preserves every F32/F16 tensor without quantization. It validates tensor shapes, dtypes, offsets, shard indexes, required encoder/classifier tensors and the supported tokenizer/encoder configuration. Checkpoints declaring a `markerV0` span head also require complete span, count-gate and `count_lstm` conditioning tensors. The GGUF v3 container uses application format 2 for span checkpoints and format 3 for boundary classification. Format 3 also records reversible aliases for boundary tensor names exceeding GGML's name-length limit; no tensor data is removed. See [format details](docs/models.md#gguf-application-format).
 
 Older GGUF files remain usable with `--states`, but must be **reconverted** for text inference. Incomplete or unsupported version-2 models fail at load time rather than returning plausible scores.
 
@@ -361,7 +363,7 @@ Token IDs, marker positions and task score offsets match exactly. All 25 hidden-
 
 The normal CTest suite needs no ML dependencies or downloaded weights. It replays checked-in, deterministic single-task and joint-schema goldens on a complete tiny encoder, checks F32/F16 storage, the C ABI, task grouping/decoding, conversion preservation and error paths. A callback-count assertion verifies one encoder traversal per multi-task call. It also compares file, buffer and non-seekable short-read stream initialization for both single-task and joint inference, including source lifetimes, malformed/truncated input and loader cleanup. Tiny F32 uses `atol=rtol=5e-5`; F16 storage is compared to F32 goldens with `5e-3`. **Real-checkpoint F16 parity has not been established.**
 
-Native C/CMake checks run without Python. The additional synthetic conversion/CLI suite uses only Python's standard library, not PyTorch. One optional upstream tool, `tests/test_parity.py`, remains for regenerating goldens and comparing real checkpoints; its ML dependencies are never part of the runtime or ordinary build. See [Testing and upstream parity](docs/testing.md) for test layers, fixture regeneration and the explicit real-model check.
+Native C/CMake checks run without Python. The additional synthetic conversion/CLI suite uses only Python's standard library, not PyTorch. One optional upstream tool, `tests/test_parity.py`, remains for regenerating goldens and comparing real checkpoints; its ML dependencies are never part of the runtime or ordinary build. Classification also passes CPU reference checks on the four [boundary-family checkpoints](docs/models.md), including additional multilingual inputs. See [Testing and upstream parity](docs/testing.md) for test layers, fixture regeneration and the explicit real-model check.
 
 The `--states` CLI path still accepts precomputed contextual `[L]` states for classification-head-only scoring: one row of `hidden_size` floats per label, in label order. It retains sigmoid probabilities by default.
 

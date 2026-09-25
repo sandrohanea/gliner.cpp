@@ -177,11 +177,13 @@ int run(const std::vector<std::string> & args) {
             gliner_init_from_file(model_path.c_str()), gliner_free);
         if (!model) throw std::runtime_error(gliner_last_error());
         if (inspect) {
-            std::cout << "architecture: gliner2.5-decide\n"
+            const bool boundary = std::string(gliner_model_architecture(model.get())) == "boundary";
+            std::cout << "architecture: " << gliner_model_architecture(model.get()) << '\n'
                       << "tensors: " << gliner_model_n_tensors(model.get()) << '\n'
                       << "hidden_size: " << gliner_model_hidden_size(model.get()) << '\n'
                       << "encoder_layers: " << gliner_model_n_layers(model.get()) << '\n'
-                      << "span_extraction: " << (gliner_model_supports_spans(model.get()) ? "yes" : "no (reconversion may be required)") << '\n'
+                      << "span_extraction: " << (gliner_model_supports_spans(model.get()) ? "yes" :
+                          boundary ? "no (boundary head not implemented)" : "no (reconversion may be required)") << '\n'
                       << "backend: " << gliner_model_backend_name(model.get()) << '\n'
                       << "device: " << gliner_model_device_name(model.get()) << '\n'
                       << "text_inference: " << (gliner_model_supports_text(model.get()) ? "yes" : "no (legacy GGUF)") << '\n';
@@ -252,6 +254,7 @@ int run(const std::vector<std::string> & args) {
         } else write_result(output, tasks[0], scores);
         if (debug) {
             output << ",\"backend\":\"" << gliner_model_backend_name(model.get())
+                   << "\",\"architecture\":\"" << gliner_model_architecture(model.get())
                    << "\",\"device\":\"" << escape_json(gliner_model_device_name(model.get())) << '"'
                    << ",\"input_ids\":";
             array(output, gliner_get_token_ids(state.get()), static_cast<size_t>(gliner_n_tokens(state.get())));

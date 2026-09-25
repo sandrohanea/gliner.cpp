@@ -72,8 +72,9 @@ GgufFile::GgufFile(ModelReader & reader) {
     try {
         reader.rethrow_error();
         if (!ctx_) throw std::runtime_error("Cannot read GGUF metadata (invalid or truncated input)");
-        if (string("general.architecture") != "gliner2.5-decide") {
-            throw std::runtime_error("GGUF is not a GLiNER2.5-Decide checkpoint");
+        const auto family = string("general.architecture");
+        if (family != "gliner2.5-decide" && family != "gliner2") {
+            throw std::runtime_error("GGUF is not a supported GLiNER2 checkpoint");
         }
         const uint64_t start = gguf_get_data_offset(ctx_);
         for (int i = 0; i < tensor_count(); ++i) {

@@ -183,6 +183,9 @@ int gliner_model_n_tensors(const struct gliner_context * ctx);
 int gliner_model_n_layers(const struct gliner_context * ctx);
 int gliner_model_supports_text(const struct gliner_context * ctx);
 int gliner_model_supports_spans(const struct gliner_context * ctx);
+// Serialized architecture, "span" or "boundary"; NULL context returns NULL.
+// Boundary support currently covers classification only, not spans or records.
+const char * gliner_model_architecture(const struct gliner_context * ctx);
 // Fixed by GGML_CUDA/GGML_METAL at build time, not by an initialization parameter.
 // Returns "cpu", "cuda" or "metal" without initializing any devices.
 const char * gliner_build_backend(void);

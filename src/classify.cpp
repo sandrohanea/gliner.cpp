@@ -77,6 +77,7 @@ struct gliner_context {
     int hidden = 0;
     int layers = 0;
     int tensors = 0;
+    std::string architecture;
     std::unique_ptr<gliner::Tokenizer> tokenizer;
     std::unique_ptr<gliner::Deberta> encoder;
     std::unique_ptr<gliner::SpanHead> span_head;
@@ -85,6 +86,7 @@ struct gliner_context {
         : device(select_device()), file(reader),
           weights(ggml_tensor_overhead() * static_cast<size_t>(file.tensor_count()) + 1024 * 1024) {
         gliner::validate_deberta_metadata(file);
+        architecture = file.string("gliner.architecture");
         hidden = file.u32("deberta.hidden_size");
         layers = file.u32("deberta.num_hidden_layers");
         tensors = file.tensor_count();
@@ -94,8 +96,14 @@ struct gliner_context {
             if (hidden > 16384) throw std::runtime_error("Unsupported hidden_size");
             w1 = file.tensor(weights.value, "classifier.0.weight", {hidden, 2 * hidden});
             b1 = file.tensor(weights.value, "classifier.0.bias", {2 * hidden});
-            w2 = file.tensor(weights.value, "classifier.2.weight", {2 * hidden, 1});
-            b2 = file.tensor(weights.value, "classifier.2.bias", {1});
+            const int output_index = file.has("gliner.classifier_output_index") ? file.u32("gliner.classifier_output_index") : 2;
+            if ((architecture == "span" && output_index != 2) ||
+                (architecture == "boundary" && output_index != 2 && output_index != 3)) {
+                throw std::runtime_error("Unsupported classifier output layer index");
+            }
+            const auto output = "classifier." + std::to_string(output_index);
+            w2 = file.tensor(weights.value, output + ".weight", {2 * hidden, 1});
+            b2 = file.tensor(weights.value, output + ".bias", {1});
             if (file.has("gliner.format_version")) {
                 encoder = std::make_unique<gliner::Deberta>(file, weights.value);
                 tokenizer = std::make_unique<gliner::Tokenizer>(file);
@@ -447,6 +455,7 @@ int gliner_model_n_tensors(const struct gliner_context * ctx) { return ctx ? ctx
 int gliner_model_n_layers(const struct gliner_context * ctx) { return ctx ? ctx->layers : 0; }
 int gliner_model_supports_text(const struct gliner_context * ctx) { return ctx && ctx->encoder ? 1 : 0; }
 int gliner_model_supports_spans(const struct gliner_context * ctx) { return ctx && ctx->span_head ? 1 : 0; }
+const char * gliner_model_architecture(const struct gliner_context * ctx) { return ctx ? ctx->architecture.c_str() : nullptr; }
 const char * gliner_model_backend_name(const struct gliner_context * ctx) {
     return ctx ? GLINER_COMPILED_BACKEND : nullptr;
 }
@@ -615,7 +624,8 @@ int gliner_extract_spans(const struct gliner_context * ctx, struct gliner_state 
         return GLINER_STATUS_INVALID_ARGUMENT;
     }
     if (!ctx->span_head) {
-        set_error("Model has no supported span metadata; reconvert a markerV0/count_lstm checkpoint");
+        set_error(ctx->architecture == "boundary" ? "Boundary span extraction is not implemented; this model supports classification only" :
+                  "Model has no supported span metadata; reconvert a markerV0/count_lstm checkpoint");
         return GLINER_STATUS_MODEL_ERROR;
     }
     try {
@@ -719,7 +729,8 @@ int gliner_extract_records(const struct gliner_context * ctx, struct gliner_stat
         return GLINER_STATUS_INVALID_ARGUMENT;
     }
     if (!ctx->span_head) {
-        set_error("Model has no supported span metadata; reconvert a markerV0/count_lstm checkpoint");
+        set_error(ctx->architecture == "boundary" ? "Boundary record extraction is not implemented; this model supports classification only" :
+                  "Model has no supported span metadata; reconvert a markerV0/count_lstm checkpoint");
         return GLINER_STATUS_MODEL_ERROR;
     }
     try {

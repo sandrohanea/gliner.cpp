@@ -66,6 +66,19 @@ KERNEL_CASES = [
     {"text": "a " * 20, "task": "a", "labels": ["a"]},
 ]
 
+MULTILINGUAL_CASES = [
+    {"text": "Je voudrais un remboursement de ma commande, s'il vous pla\u00eet.",
+     "task": "intention", "labels": ["remboursement", "suivi de commande", "autre"]},
+    {"text": "\u8bf7\u9000\u8fd8\u6211\u7684\u8ba2\u5355\u8d39\u7528\uff0c\u6211\u5bf9\u914d\u9001\u4e0d\u6ee1\u610f\u3002",
+     "task": "\u610f\u56fe", "labels": ["\u9000\u6b3e", "\u8ba2\u5355\u72b6\u6001", "\u5176\u4ed6"]},
+    {"text": "\u0623\u0631\u064a\u062f \u0627\u0633\u062a\u0631\u062f\u0627\u062f \u0645\u0628\u0644\u063a \u0637\u0644\u0628\u064a.",
+     "task": "\u0627\u0644\u0646\u064a\u0629", "labels": ["\u0627\u0633\u062a\u0631\u062f\u0627\u062f", "\u062d\u0627\u0644\u0629 \u0627\u0644\u0637\u0644\u0628", "\u0623\u062e\u0631\u0649"]},
+    {"text": "Quiero un reembolso. La entrega lleg\u00f3 tarde y estoy decepcionado.", "tasks": [
+        {"task": "intenci\u00f3n", "labels": ["reembolso", "estado del pedido", "otro"]},
+        {"task": "sentimiento", "labels": ["positivo", "neutral", "negativo"]},
+    ]},
+]
+
 SPAN_CASES = [
     {"text": "Tim Cook works at Apple in California.", "labels": ["person", "company", "location"],
      "descriptions": ["A person name", "A company name", "A location name"], "threshold": 0.5},
@@ -105,10 +118,18 @@ RECORD_CASES = [
 
 def load_oracle(checkpoint):
     config = DebertaV2Config.from_pretrained(checkpoint / "encoder_config")
+    model_config = json.loads((checkpoint / "config.json").read_text(encoding="utf8"))
+    architecture = model_config.get("architecture")
+    if architecture not in ("span", "boundary"):
+        raise ValueError("Unsupported reference architecture")
+    dropout = model_config["boundary_head"].get("dropout", 0.1) if architecture == "boundary" else 0
     with torch.device("meta"):
         encoder = DebertaV2Model(config)
-        classifier = torch.nn.Sequential(torch.nn.Linear(config.hidden_size, 2 * config.hidden_size),
-                                         torch.nn.ReLU(), torch.nn.Linear(2 * config.hidden_size, 1))
+        layers = [torch.nn.Linear(config.hidden_size, 2 * config.hidden_size), torch.nn.ReLU()]
+        if dropout > 0:
+            layers.append(torch.nn.Dropout(dropout))
+        layers.append(torch.nn.Linear(2 * config.hidden_size, 1))
+        classifier = torch.nn.Sequential(*layers)
     weights, head = {}, {}
     index = checkpoint / "model.safetensors.index.json"
     shards = sorted(set(json.loads(index.read_text())["weight_map"].values())) if index.exists() else ["model.safetensors"]
@@ -448,6 +469,7 @@ def main():
     group.add_argument("--kernel-only", action="store_true", help="Generate/test short and long sequences with a 32-wide synthetic encoder")
     group.add_argument("--spans-only", action="store_true", help="Generate/test grouped entity span extraction using gliner-extract")
     group.add_argument("--records-only", action="store_true", help="Generate/test count-conditioned records using gliner-extract")
+    group.add_argument("--multilingual-only", action="store_true", help="Compare French, Chinese, Arabic and Spanish classification inputs")
     parser.add_argument("--case", type=int, action="append")
     parser.add_argument("--tolerance", type=float, default=3e-4)
     args = parser.parse_args()
@@ -472,7 +494,9 @@ def main():
                               compact_tokens=args.kernel_only, spans=args.spans_only or args.records_only,
                               records=args.records_only)
         oracle = load_span_oracle(checkpoint) if args.spans_only or args.records_only else load_oracle(checkpoint)
-        cases = RECORD_CASES if args.records_only else SPAN_CASES if args.spans_only else KERNEL_CASES if args.kernel_only else BATCH_CASES if args.batch_only else CASES if args.single_only else CASES + BATCH_CASES
+        cases = (MULTILINGUAL_CASES if args.multilingual_only else RECORD_CASES if args.records_only else
+                 SPAN_CASES if args.spans_only else KERNEL_CASES if args.kernel_only else
+                 BATCH_CASES if args.batch_only else CASES if args.single_only else CASES + BATCH_CASES)
         selected = cases if args.case is None else [cases[i] for i in args.case]
         fixtures = []
         for case in selected:
@@ -499,7 +523,8 @@ def main():
                                                                       "--single-only " if args.single_only else
                                                                       "--kernel-only " if args.kernel_only else
                                                                       "--spans-only " if args.spans_only else
-                                                                      "--records-only " if args.records_only else "") + "--write-golden"},
+                                                                      "--records-only " if args.records_only else
+                                                                      "--multilingual-only " if args.multilingual_only else "") + "--write-golden"},
                 "fixtures": fixtures}, separators=(",", ":")), encoding="utf8")
 
 

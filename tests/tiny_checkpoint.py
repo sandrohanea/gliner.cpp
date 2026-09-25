@@ -17,7 +17,8 @@ def write_safetensors(path, tensors, dtype="F32"):
     path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + payload)
 
 
-def create_checkpoint(root, hidden=2, layers=1, dtype="F32", compact_tokens=False, spans=False, record_count=1, records=False):
+def create_checkpoint(root, hidden=2, layers=1, dtype="F32", compact_tokens=False, spans=False, record_count=1,
+                      records=False, boundary=False, classifier_dropout=0.1):
     (root / "encoder_config").mkdir(exist_ok=True)
     config = {
         "model_type": "deberta-v2", "hidden_size": hidden, "num_hidden_layers": layers,
@@ -52,6 +53,11 @@ def create_checkpoint(root, hidden=2, layers=1, dtype="F32", compact_tokens=Fals
     }
     config["vocab_size"] = len(vocab) + len(markers)
     model_config = {"architecture": "span", "token_pooling": "first"}
+    if boundary:
+        if spans:
+            raise ValueError("Synthetic boundary classification cannot declare a span head")
+        model_config.update(architecture="boundary", architecture_version=1,
+                            boundary_head={"dropout": classifier_dropout})
     if spans:
         model_config.update(max_width=8, counting_layer="count_lstm",
                             span_head={"span_mode": "markerV0", "max_width": 8})
@@ -122,5 +128,10 @@ def create_checkpoint(root, hidden=2, layers=1, dtype="F32", compact_tokens=Fals
         tensor("count_embed.projector.2.bias", [hidden])
     # Retained but never executed by the classification runtime.
     tensors["unused.span.weight" if spans else "span_rep.unused.weight"] = ([2, 3, 4], list(range(24)))
+    if boundary:
+        if classifier_dropout > 0:
+            for suffix in ("weight", "bias"):
+                tensors[f"classifier.3.{suffix}"] = tensors.pop(f"classifier.2.{suffix}")
+        tensors["boundary_head." + "long_component_name_" * 4 + ".weight"] = ([2, 3], list(range(6)))
     write_safetensors(root / "model.safetensors", tensors, dtype)
     return tensors

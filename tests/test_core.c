@@ -51,6 +51,33 @@ static void span_layer(int layer, const float * values, int tokens, int hidden, 
     else ++*count;
 }
 
+static int test_boundary(const char * path) {
+    struct gliner_context * ctx = gliner_init_from_file(path);
+    CHECK(ctx != NULL);
+    CHECK(strcmp(gliner_model_architecture(ctx), "boundary") == 0);
+    CHECK(gliner_model_supports_text(ctx) && !gliner_model_supports_spans(ctx));
+    struct gliner_state * state = gliner_init_state(ctx);
+    CHECK(state != NULL);
+    const char * labels[] = {"yes", "no"};
+    const struct gliner_classification_task tasks[] = {
+        {"intent", labels, 2, NULL, NULL}, {"sentiment", labels, 2, NULL, NULL}};
+    CHECK(gliner_classify_text_batch(ctx, state, "hello world", tasks, 2, NULL) == GLINER_STATUS_OK);
+    CHECK(gliner_n_scores(state) == 4 && gliner_n_tasks(state) == 2);
+    const struct gliner_span_label spans[] = {{"person", NULL}};
+    CHECK(gliner_extract_spans(ctx, state, "hello", spans, 1, NULL) == GLINER_STATUS_MODEL_ERROR);
+    CHECK(strstr(gliner_last_error(), "Boundary span") != NULL);
+    CHECK(gliner_n_scores(state) == 0 && gliner_n_tokens(state) == 0);
+    const struct gliner_record_field fields[] = {{"terms", NULL, GLINER_FIELD_LIST}};
+    CHECK(gliner_extract_records(ctx, state, "hello", "request", fields, 1, NULL) == GLINER_STATUS_MODEL_ERROR);
+    CHECK(strstr(gliner_last_error(), "Boundary record") != NULL);
+    CHECK(gliner_get_record_scores(state) == NULL);
+    CHECK(gliner_classify_text(ctx, state, "hello", "intent", labels, 2, NULL) == GLINER_STATUS_OK);
+    CHECK(gliner_n_scores(state) == 2);
+    gliner_free_state(state);
+    gliner_free(ctx);
+    return 0;
+}
+
 static int test_spans(const char * path) {
     struct gliner_context * ctx = gliner_init_from_file(path);
     CHECK(ctx != NULL && gliner_model_supports_spans(ctx));
@@ -424,9 +451,11 @@ static int test_loading(const char * path, struct gliner_context * reference) {
 }
 
 int main(int argc, char ** argv) {
+    if (argc == 3 && strcmp(argv[1], "--boundary") == 0) return test_boundary(argv[2]);
     if (argc == 4 && strcmp(argv[1], "--records") == 0) return test_records(argv[2], atoi(argv[3]));
     if (argc == 3 && strcmp(argv[1], "--spans") == 0) return test_spans(argv[2]);
     CHECK(gliner_model_hidden_size(NULL) == 0);
+    CHECK(gliner_model_architecture(NULL) == NULL);
     CHECK(gliner_model_n_tensors(NULL) == 0);
     CHECK(gliner_model_n_layers(NULL) == 0);
     CHECK(gliner_model_supports_text(NULL) == 0);

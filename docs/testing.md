@@ -54,6 +54,8 @@ The Python reference runs on CPU; it can compare a C++ CPU, CUDA or strict Metal
 
 The tool compares exact token IDs, marker positions and task ranges; embeddings plus every encoder layer; contextual label states; raw logits; and task-local probabilities/decisions. The real F32 tolerance is `atol=rtol=3e-4`. The default is all 13 cases; `--single-only`, `--batch-only` and `--case N` narrow the run.
 
+The classification oracle supports both span and boundary checkpoint classifier layouts, including the output-layer index shifted by dropout. `--multilingual-only` selects four additional French, Chinese, Arabic and Spanish cases. The [model matrix](models.md) records real CPU results for the four additional boundary-family checkpoints. Synthetic coverage verifies version-3 metadata, long-name alias reversibility, byte-preserved F32/F16 tensors, dropout/no-dropout classifier layouts, and explicit rejection of unsupported boundary extraction.
+
 For CTest integration, set `GLINER_PARITY_CHECKPOINT` and `GLINER_PARITY_GGUF` to absolute local paths and `Python3_EXECUTABLE` to the oracle environment's interpreter. Leave `GLINER_PYTHON_TESTS=ON`. No model is downloaded automatically.
 
 For extraction, run the same tool with `--spans-only` or `--records-only`, a span-capable GGUF and `gliner-extract` instead of `gliner-classify`. Set `GLINER_SPAN_PARITY_GGUF` alongside `GLINER_PARITY_CHECKPOINT` to register both in CTest. The reference uses upstream `SpanRepLayer`, `CountLSTM`, the count head and overlap decoder; there is no separate Python extraction implementation in production. Structured scoring checks the recurrent state and positional embedding for every predicted slot, not a repeated copy of the first entity step.

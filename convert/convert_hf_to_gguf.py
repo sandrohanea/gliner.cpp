@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Stream a local GLiNER2.5-Decide safetensors checkpoint into GGUF v3.
+"""Stream a compatible GLiNER2 safetensors checkpoint into GGUF v3.
 
 Only the Python standard library is needed. Tensor bytes stay in their original
 F32/F16 format; GGUF dimensions are reversed to match ggml's layout.
+Span checkpoints support classification/extraction; boundary checkpoints currently
+support classification only. All tensors are preserved regardless of capability.
 """
 
 import argparse
+import hashlib
 import json
 import math
 import struct
@@ -227,8 +230,21 @@ def span_shapes(hidden):
 
 def metadata(directory):
     model_config = read_json(directory / "config.json")
-    if model_config.get("architecture") != "span":
-        raise ValueError("This converter targets GLiNER2.5-Decide's serialized span checkpoint")
+    architecture = model_config.get("architecture")
+    if architecture not in ("span", "boundary"):
+        raise ValueError("Only GLiNER2 span and boundary checkpoints are supported")
+    output_index = 2
+    if architecture == "boundary":
+        if model_config.get("architecture_version") != 1:
+            raise ValueError("Only boundary architecture version 1 is supported for classification")
+        boundary_head = model_config.get("boundary_head")
+        if not isinstance(boundary_head, dict):
+            raise ValueError("Missing boundary_head configuration")
+        dropout = boundary_head.get("dropout", 0.1)
+        if not isinstance(dropout, (float, int)) or not math.isfinite(dropout) or not 0 <= dropout <= 1:
+            raise ValueError("Invalid boundary classifier dropout")
+        # Dropout is inactive at inference but changes the saved Sequential indices.
+        output_index = 3 if dropout > 0 else 2
     encoder_path = directory / "encoder_config" / "config.json"
     if not encoder_path.exists():
         raise FileNotFoundError(f"Missing encoder config: {encoder_path}")
@@ -288,11 +304,12 @@ def metadata(directory):
     lower_from, lower_to, ranges = unicode_tables()
 
     kv = [
-        ("general.architecture", KV_STRING, "gliner2.5-decide"),
+        ("general.architecture", KV_STRING, "gliner2" if architecture == "boundary" else "gliner2.5-decide"),
         ("general.name", KV_STRING, directory.name),
-        ("gliner.architecture", KV_STRING, "span"),
+        ("gliner.architecture", KV_STRING, architecture),
         ("gliner.token_pooling", KV_STRING, model_config.get("token_pooling", "first")),
-        ("gliner.format_version", KV_U32, 2),
+        ("gliner.format_version", KV_U32, 3 if architecture == "boundary" else 2),
+        ("gliner.classifier_output_index", KV_U32, output_index),
         ("deberta.hidden_size", KV_U32, int(encoder["hidden_size"])),
         ("deberta.num_hidden_layers", KV_U32, int(encoder["num_hidden_layers"])),
         ("deberta.num_attention_heads", KV_U32, int(encoder["num_attention_heads"])),
@@ -302,7 +319,7 @@ def metadata(directory):
         ("deberta.position_buckets", KV_U32, encoder["position_buckets"]),
         ("deberta.max_relative_positions", KV_U32, relative),
         ("deberta.layer_norm_eps", KV_F32, float(encoder.get("layer_norm_eps", 1e-7))),
-        ("deberta.variant", KV_STRING, "decide-v1"),
+        ("deberta.variant", KV_STRING, "deberta-v3" if architecture == "boundary" else "decide-v1"),
         ("tokenizer.ggml.model", KV_STRING, "unigram"),
         ("tokenizer.ggml.tokens", KV_ARRAY, (KV_STRING, tokens)),
         ("tokenizer.ggml.scores", KV_ARRAY, (KV_F32, scores)),
@@ -319,8 +336,10 @@ def metadata(directory):
     h = encoder["hidden_size"]
     shapes = encoder_shapes(encoder)
     shapes.update({"classifier.0.weight": (2 * h, h), "classifier.0.bias": (2 * h,),
-                   "classifier.2.weight": (1, 2 * h), "classifier.2.bias": (1,)})
-    if "span_head" in model_config:
+                   f"classifier.{output_index}.weight": (1, 2 * h), f"classifier.{output_index}.bias": (1,)})
+    if architecture == "boundary":
+        kv.append(("gliner.capabilities", KV_STRING, "classification"))
+    elif "span_head" in model_config:
         head = model_config["span_head"]
         width = head.get("max_width")
         if head.get("span_mode") != "markerV0" or model_config.get("counting_layer") != "count_lstm":
@@ -391,6 +410,23 @@ def convert(directory, output):
         if by_name[required].shape != shape:
             raise ValueError(f"Invalid shape for {required}: expected {shape}")
 
+    stored_names = {tensor.name: tensor.name for tensor in tensors}
+    long_names = [tensor.name for tensor in tensors if len(tensor.name.encode("utf8")) >= 64]
+    if long_names:
+        if dict((key, value) for key, _, value in kv)["gliner.format_version"] < 3:
+            raise ValueError("Tensor names of 64 bytes or more require application format version 3")
+        used = set(stored_names.values())
+        aliases = []
+        for name in long_names:
+            alias = "gliner.t." + hashlib.sha256(name.encode("utf8")).hexdigest()[:48]
+            if alias in used:
+                raise ValueError(f"Tensor name alias collision for {name}")
+            used.add(alias)
+            stored_names[name] = alias
+            aliases.append(alias)
+        kv += [("gliner.tensor_name_map.original", KV_ARRAY, (KV_STRING, long_names)),
+               ("gliner.tensor_name_map.stored", KV_ARRAY, (KV_STRING, aliases))]
+
     offset = 0
     with output.open("wb") as target:
         target.write(b"GGUF")
@@ -400,7 +436,7 @@ def convert(directory, output):
         for key, kind, value in kv:
             write_kv(target, key, kind, value)
         for tensor in tensors:
-            target.write(gguf_string(tensor.name))
+            target.write(gguf_string(stored_names[tensor.name]))
             target.write(u32(len(tensor.shape)))
             for dim in reversed(tensor.shape):
                 target.write(u64(dim))

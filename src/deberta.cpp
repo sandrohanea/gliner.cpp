@@ -7,8 +7,15 @@
 namespace gliner {
 
 void validate_deberta_metadata(const GgufFile & file) {
-    if (file.string("gliner.architecture") != "span") {
-        throw std::runtime_error("Expected GLiNER2.5-Decide's span checkpoint");
+    const auto architecture = file.string("gliner.architecture");
+    if (architecture != "span" && architecture != "boundary") {
+        throw std::runtime_error("Unsupported GLiNER2 architecture");
+    }
+    if (architecture == "boundary" &&
+        (!file.has("gliner.format_version") || file.u32("gliner.format_version") != 3 ||
+         file.string("general.architecture") != "gliner2" ||
+         file.string("gliner.capabilities") != "classification" || file.has("gliner.span_mode"))) {
+        throw std::runtime_error("Boundary GGUF supports classification only in application format version 3");
     }
     if (file.string("gliner.token_pooling") != "first") {
         throw std::runtime_error("Only first-subword token pooling is supported");
@@ -23,7 +30,11 @@ void validate_deberta_metadata(const GgufFile & file) {
 }
 
 Deberta::Deberta(const GgufFile & file, ggml_context * weights) {
-    if (file.u32("gliner.format_version") != 2 || file.string("deberta.variant") != "decide-v1") {
+    const auto architecture = file.string("gliner.architecture");
+    const bool supported = architecture == "span" ?
+        file.u32("gliner.format_version") == 2 && file.string("deberta.variant") == "decide-v1" :
+        file.u32("gliner.format_version") == 3 && file.string("deberta.variant") == "deberta-v3";
+    if (!supported) {
         throw std::runtime_error("Unsupported encoder format or configuration");
     }
     hidden = file.u32("deberta.hidden_size");

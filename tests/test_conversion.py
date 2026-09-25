@@ -58,7 +58,7 @@ def parity_environment_contract():
     assert dict(os.environ) == original
 
 
-def preserved_tensors(path, tensors, dtype):
+def preserved_tensors(path, tensors, dtype, version=2):
     with path.open("rb") as f:
         def integer():
             return struct.unpack("<I", f.read(4))[0]
@@ -84,13 +84,18 @@ def preserved_tensors(path, tensors, dtype):
         for _ in range(keys):
             key = string()
             metadata[key] = value(integer())
-        assert metadata["gliner.format_version"] == 2
+        assert metadata["gliner.format_version"] == version
+        original = metadata.get("gliner.tensor_name_map.original", [])
+        stored = metadata.get("gliner.tensor_name_map.stored", [])
+        assert len(original) == len(stored) and len(set(stored)) == len(stored)
+        aliases = dict(zip(stored, original))
         records = []
         for _ in range(count):
             name = string()
+            assert len(name.encode("utf8")) < 64
             dims = tuple(size() for _ in range(integer()))
             kind, offset = integer(), size()
-            records.append((name, dims, kind, offset))
+            records.append((aliases.get(name, name), dims, kind, offset))
         start = (f.tell() + 31) // 32 * 32
         assert {r[0] for r in records} == set(tensors), "Tensor pruning or renaming"
         for name, dims, kind, offset in records:
@@ -99,6 +104,41 @@ def preserved_tensors(path, tensors, dtype):
             expected = struct.pack("<" + ("f" if dtype == "F32" else "e") * len(values), *values)
             f.seek(start + offset)
             assert f.read(len(expected)) == expected, name
+
+def boundary_contract(converter, binary, c_test, root, extract):
+    states = root / "boundary-states.txt"
+    states.write_text("1 2\n-1 2\n", encoding="utf8")
+    for dtype in ("F32", "F16"):
+        for dropout in (0.0, 0.1):
+            tensors = create_checkpoint(root, dtype=dtype, boundary=True, classifier_dropout=dropout)
+            model = root / f"boundary-{dtype}-{dropout}.gguf"
+            converter.convert(root, model)
+            preserved_tensors(model, tensors, dtype, version=3)
+            inspect = run(binary, model, "--inspect")
+            assert "architecture: boundary\n" in inspect and "span_extraction: no" in inspect, inspect
+            result = json.loads(run(binary, model, "--labels", "first,second", "--states", str(states)))
+            assert_close([s["logit"] for s in result["scores"]], [5.5, 3.5], 1e-5, "boundary head")
+            result = json.loads(run(binary, model, "--text", "hello", "--task", "intent", "--labels", "first,second", "--debug"))
+            assert result["architecture"] == "boundary"
+            assert len(result["scores"]) == 2 and result["task_offsets"] == [0, 2]
+            subprocess.run([c_test, "--boundary", str(model)], check=True)
+            if extract:
+                error = failure([extract], model, "--text", "hello", "--labels", "person")
+                assert "Boundary span extraction is not implemented" in error.stderr
+                error = failure([extract], model, "--text", "hello", "--structure", "requests", "--field", "terms")
+                assert "Boundary record extraction is not implemented" in error.stderr
+    tensors.pop("classifier.3.weight")
+    write_safetensors(root / "model.safetensors", tensors)
+    try:
+        converter.convert(root, root / "boundary-missing.gguf")
+    except ValueError as error:
+        assert "classifier.3.weight" in str(error)
+    else:
+        raise AssertionError("Boundary classifier tensor validation was skipped")
+    damaged = root / "boundary-capability.gguf"
+    damaged.write_bytes(model.read_bytes().replace(b"classification", b"unsupportedxxx"))
+    failure(binary, damaged, "--inspect")
+    create_checkpoint(root)
 
 
 def offline_parity(converter, binary, root, backend):
@@ -502,6 +542,7 @@ def main(converter_path, executable, c_test, expected_backend=None, fast_metal=F
         if extract:
             span_contract(converter, extract, c_test, root, backend, fast_metal)
             record_contract(converter, extract, c_test, root, backend, fast_metal)
+        boundary_contract(converter, binary, c_test, root, extract)
         negative_conversion(converter, binary, root)
     if fast_metal:
         print("Conversion, C API and CLI checks passed on fast Metal; strict encoder parity was not run")
