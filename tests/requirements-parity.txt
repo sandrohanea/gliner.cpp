@@ -4,5 +4,5 @@ transformers==4.48.1
 tokenizers==0.21.4
 sentencepiece==0.2.2
 safetensors==0.8.0
-numpy==2.5.3
+numpy==1.26.4
 gliner2 @ git+https://github.com/fastino-ai/GLiNER2.git@1a80c9c85272cd6809009b102b770c452e928196

@@ -36,6 +36,7 @@ def verify(result, modes, iterations, warmup, tasks, backend, model):
     assert result["schema_version"] == 1
     assert result["backend"] == backend and result["device"]
     assert isinstance(result["build_type"], str) and result["compiler"]
+    assert result["metal_precision_mode"] in (("strict_f32", "fast") if backend == "metal" else ("not_applicable",))
     assert result["model_file_bytes"] == model.stat().st_size
     assert result["model_load_count"] == 1
     assert math.isfinite(result["model_load_ms"]) and result["model_load_ms"] > 0

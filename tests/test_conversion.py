@@ -293,7 +293,7 @@ def batch_contract(binary, model, root):
     failure(binary, model, *args, "--states", str(root / "states.txt"))
 
 
-def main(converter_path, executable, c_test, expected_backend=None):
+def main(converter_path, executable, c_test, expected_backend=None, fast_metal=False):
     parity_environment_contract()
     spec = importlib.util.spec_from_file_location("converter", converter_path)
     converter = importlib.util.module_from_spec(spec)
@@ -303,6 +303,8 @@ def main(converter_path, executable, c_test, expected_backend=None):
     assert backend in ("cpu", "cuda", "metal"), backend
     if expected_backend is not None:
         assert backend == expected_backend, (backend, expected_backend)
+    if fast_metal and backend != "metal":
+        raise ValueError("--fast-metal requires a Metal build")
     configure_parity_environment(backend)
     binary = [executable]
     with tempfile.TemporaryDirectory() as temp:
@@ -348,7 +350,10 @@ def main(converter_path, executable, c_test, expected_backend=None):
             from_text = json.loads(run(binary, model, *base))
             assert from_file == from_text
             batch_contract(binary, model, root)
-        offline_parity(converter, binary, root, backend)
+        if fast_metal:
+            print("Skipping strict F32/F16 encoder goldens for fast Metal; conversion and API checks continue", flush=True)
+        else:
+            offline_parity(converter, binary, root, backend)
         tensors = create_checkpoint(root)
         large_count = (8 * 1024 * 1024 + 32) // 4
         tensors["span_rep.unused.weight"] = ([large_count], [0.0] * large_count)
@@ -357,7 +362,10 @@ def main(converter_path, executable, c_test, expected_backend=None):
         converter.convert(root, large_model)
         subprocess.run([c_test, str(large_model), backend], check=True)
         negative_conversion(converter, binary, root)
-    print(f"Conversion, C API, CLI and offline F32/F16 encoder parity passed on {backend}")
+    if fast_metal:
+        print("Conversion, C API and CLI checks passed on fast Metal; strict encoder parity was not run")
+    else:
+        print(f"Conversion, C API, CLI and offline F32/F16 encoder parity passed on {backend}")
 
 
 if __name__ == "__main__":
@@ -366,5 +374,6 @@ if __name__ == "__main__":
     parser.add_argument("binary")
     parser.add_argument("c_test")
     parser.add_argument("--expect-backend", choices=("cpu", "cuda", "metal"), help="Assert the binary's build backend; does not select it")
+    parser.add_argument("--fast-metal", action="store_true", help="Skip strict encoder goldens for the intentional fast Metal build")
     args = parser.parse_args()
-    main(args.converter, args.binary, args.c_test, args.expect_backend)
+    main(args.converter, args.binary, args.c_test, args.expect_backend, args.fast_metal)

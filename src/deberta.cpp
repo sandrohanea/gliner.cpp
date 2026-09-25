@@ -69,10 +69,21 @@ namespace {
 ggml_tensor * f32(ggml_context * ctx, ggml_tensor * tensor) {
     return tensor->type == GGML_TYPE_F32 ? tensor : ggml_cast(ctx, tensor, GGML_TYPE_F32);
 }
+
+ggml_tensor * matmul(ggml_context * ctx, ggml_tensor * weights, ggml_tensor * input) {
+    auto * result = ggml_mul_mat(ctx, weights, input);
+#ifndef GLINER_METAL_FAST_MATH
+    if (!ggml_prec_set_acc(result, GGML_PREC_F32) ||
+        !ggml_prec_set_src(result, GGML_PREC_F32, 1)) {
+        throw std::runtime_error("GGML cannot preserve F32 matrix multiplication precision");
+    }
+#endif
+    return result;
+}
 }
 
 ggml_tensor * Deberta::linear(ggml_context * ctx, ggml_tensor * x, const std::string & name) const {
-    return ggml_add(ctx, ggml_mul_mat(ctx, tensors_.at(name + ".weight"), x),
+    return ggml_add(ctx, matmul(ctx, tensors_.at(name + ".weight"), x),
                     f32(ctx, tensors_.at(name + ".bias")));
 }
 
@@ -135,11 +146,11 @@ ggml_tensor * Deberta::build(ggml_context * ctx, ggml_tensor * ids,
         auto * v = split_heads(linear(ctx, x, prefix + "attention.self.value_proj"));
         auto * pq = split_heads(linear(ctx, relative, prefix + "attention.self.query_proj"));
         auto * pk = split_heads(linear(ctx, relative, prefix + "attention.self.key_proj"));
-        auto * content = ggml_mul_mat(ctx, ggml_scale(ctx, k, scale), q);
-        auto * c2p = ggml_scale(ctx, gather(ggml_mul_mat(ctx, pk, q), c2p_indices), scale);
-        auto * p2c = ggml_scale(ctx, gather(ggml_mul_mat(ctx, pq, k), p2c_indices), scale);
+        auto * content = matmul(ctx, ggml_scale(ctx, k, scale), q);
+        auto * c2p = ggml_scale(ctx, gather(matmul(ctx, pk, q), c2p_indices), scale);
+        auto * p2c = ggml_scale(ctx, gather(matmul(ctx, pq, k), p2c_indices), scale);
         auto * probs = ggml_soft_max(ctx, ggml_add(ctx, content, ggml_add(ctx, c2p, p2c)));
-        auto * attended = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, v)), probs);
+        auto * attended = matmul(ctx, ggml_cont(ctx, ggml_transpose(ctx, v)), probs);
         attended = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, attended, 0, 2, 1, 3)), hidden, tokens);
         auto * attention = norm(ctx, ggml_add(ctx, x, linear(ctx, attended, prefix + "attention.output.dense")),
                                 prefix + "attention.output.LayerNorm");

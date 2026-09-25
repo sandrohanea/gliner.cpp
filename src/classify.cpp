@@ -155,9 +155,19 @@ namespace {
 
 ggml_tensor * classification_graph(ggml_context * eval, const gliner_context * ctx, ggml_tensor * input) {
     auto * h = ggml_mul_mat(eval, ctx->w1, input);
+#ifndef GLINER_METAL_FAST_MATH
+    if (!ggml_prec_set_acc(h, GGML_PREC_F32) || !ggml_prec_set_src(h, GGML_PREC_F32, 1)) {
+        throw std::runtime_error("GGML cannot preserve F32 classifier precision");
+    }
+#endif
     auto * b1 = ctx->b1->type == GGML_TYPE_F32 ? ctx->b1 : ggml_cast(eval, ctx->b1, GGML_TYPE_F32);
     h = ggml_relu(eval, ggml_add(eval, h, b1));
     auto * out = ggml_mul_mat(eval, ctx->w2, h);
+#ifndef GLINER_METAL_FAST_MATH
+    if (!ggml_prec_set_acc(out, GGML_PREC_F32) || !ggml_prec_set_src(out, GGML_PREC_F32, 1)) {
+        throw std::runtime_error("GGML cannot preserve F32 classifier precision");
+    }
+#endif
     auto * b2 = ctx->b2->type == GGML_TYPE_F32 ? ctx->b2 : ggml_cast(eval, ctx->b2, GGML_TYPE_F32);
     out = ggml_add(eval, out, b2);
     ggml_set_output(out);

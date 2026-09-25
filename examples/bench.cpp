@@ -283,6 +283,7 @@ int gliner_cli_main(const std::vector<std::string> & args) {
             << "\",\"device\":\"" << escape_json(gliner_model_device_name(model.get()))
             << "\",\"build_type\":\"" << escape_json(GLINER_BENCH_BUILD_TYPE)
             << "\",\"compiler\":\"" << escape_json(GLINER_BENCH_COMPILER)
+            << "\",\"metal_precision_mode\":\"" << GLINER_BENCH_METAL_PRECISION_MODE
             << "\",\"model\":\"" << escape_json(options.model) << "\",\"model_file_bytes\":" << file_bytes
             << ",\"hidden_size\":" << gliner_model_hidden_size(model.get())
             << ",\"encoder_layers\":" << gliner_model_n_layers(model.get())

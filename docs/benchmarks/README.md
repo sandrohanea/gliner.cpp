@@ -5,6 +5,7 @@ Reports contain measurements supplied from the named device, not performance gua
 | Date | Platform | Comparisons |
 |---|---|---|
 | 2026-09-25 | [Windows / Core i7-13800H / RTX 4060 Laptop](2026-09-25-windows-rtx4060.md) | C++ and Python, CPU and CUDA, joint and separate questions |
+| 2026-09-25 | [macOS / Apple M4 Pro](2026-09-25-macos-m4-pro.md) | C++ CPU/Metal and Python CPU, joint and separate questions |
 
 ## Adding a device report
 

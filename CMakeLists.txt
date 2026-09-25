@@ -12,9 +12,11 @@ option(GLINER_FETCH_UTF8PROC "Download utf8proc if no installed copy is found" O
 set(GLINER_GGML_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ggml" CACHE PATH "Local GGML checkout")
 option(GGML_CUDA "Build gliner for the GGML CUDA backend" OFF)
 option(GGML_METAL "Build gliner for the GGML Metal backend" ${APPLE})
+option(GLINER_METAL_STRICT_F32 "Use the F32 GGML Metal dispatch fix; disable for faster, lower-precision matrix products" ON)
 set(GLINER_BUILD_CUDA "${GGML_CUDA}")
 set(GLINER_BUILD_METAL "${GGML_METAL}")
 set(GLINER_COMPILED_BACKEND "cpu")
+set(GLINER_METAL_PRECISION_MODE "not_applicable")
 
 if(GLINER_BUILD_CUDA AND GLINER_BUILD_METAL)
     message(FATAL_ERROR "Select only one GPU backend: GGML_CUDA or GGML_METAL")
@@ -66,6 +68,15 @@ endif()
 if(GLINER_BUILD_CUDA)
     include(cmake/GgmlCudaPrecision.cmake)
     gliner_fix_cuda_precision()
+elseif(GLINER_BUILD_METAL)
+    if(GLINER_METAL_STRICT_F32)
+        include(cmake/GgmlMetalPrecision.cmake)
+        gliner_fix_metal_precision()
+        set(GLINER_METAL_PRECISION_MODE "strict_f32")
+    else()
+        set(GLINER_METAL_PRECISION_MODE "fast")
+        message(STATUS "gliner: fast Metal matrix products enabled; strict F32 encoder parity is not expected")
+    endif()
 endif()
 
 find_path(UTF8PROC_INCLUDE_DIR utf8proc.h)
@@ -97,6 +108,9 @@ add_library(gliner STATIC
 target_include_directories(gliner PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(gliner PUBLIC ${GLINER_GGML_TARGET} PRIVATE gliner_unicode)
 target_compile_definitions(gliner PRIVATE GLINER_COMPILED_BACKEND="${GLINER_COMPILED_BACKEND}")
+if(GLINER_BUILD_METAL AND NOT GLINER_METAL_STRICT_F32)
+    target_compile_definitions(gliner PRIVATE GLINER_METAL_FAST_MATH=1)
+endif()
 if(MSVC)
     target_compile_options(gliner PRIVATE /W4 /utf-8)
 else()
@@ -109,7 +123,8 @@ add_executable(gliner-bench examples/bench.cpp examples/main.cpp)
 target_link_libraries(gliner-bench PRIVATE gliner)
 target_compile_definitions(gliner-bench PRIVATE
     GLINER_BENCH_BUILD_TYPE="$<CONFIG>"
-    GLINER_BENCH_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
+    GLINER_BENCH_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
+    GLINER_BENCH_METAL_PRECISION_MODE="${GLINER_METAL_PRECISION_MODE}")
 if(MINGW)
     target_link_options(gliner-classify PRIVATE -municode)
     target_link_options(gliner-bench PRIVATE -municode)
@@ -129,13 +144,26 @@ if(BUILD_TESTING)
         add_test(NAME gliner-cuda-precision-config
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cuda_precision_config.py"
                 "${CMAKE_COMMAND}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GgmlCudaPrecision.cmake")
-        add_test(NAME gliner-conversion
+        add_test(NAME gliner-metal-precision-config
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_metal_precision_config.py"
+                "${CMAKE_COMMAND}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GgmlMetalPrecision.cmake")
+        set(GLINER_CONVERSION_OPTIONS "")
+        set(GLINER_CONVERSION_TEST gliner-conversion)
+        if(GLINER_BUILD_METAL AND NOT GLINER_METAL_STRICT_F32)
+            list(APPEND GLINER_CONVERSION_OPTIONS --fast-metal)
+            set(GLINER_CONVERSION_TEST gliner-conversion-fast)
+            set(GLINER_CONVERSION_LABELS "format;metal")
+        else()
+            set(GLINER_CONVERSION_LABELS "parity;${GLINER_COMPILED_BACKEND}")
+        endif()
+        add_test(NAME ${GLINER_CONVERSION_TEST}
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_conversion.py"
                     "${CMAKE_CURRENT_SOURCE_DIR}/convert/convert_hf_to_gguf.py"
                     "$<TARGET_FILE:gliner-classify>"
-                    "$<TARGET_FILE:gliner-test>" --expect-backend "${GLINER_COMPILED_BACKEND}")
-        set_tests_properties(gliner-conversion PROPERTIES LABELS "parity;${GLINER_COMPILED_BACKEND}" TIMEOUT 600)
-        list(APPEND GLINER_PARITY_TESTS gliner-conversion)
+                    "$<TARGET_FILE:gliner-test>" --expect-backend "${GLINER_COMPILED_BACKEND}"
+                    ${GLINER_CONVERSION_OPTIONS})
+        set_tests_properties(${GLINER_CONVERSION_TEST} PROPERTIES LABELS "${GLINER_CONVERSION_LABELS}" TIMEOUT 600)
+        list(APPEND GLINER_PARITY_TESTS ${GLINER_CONVERSION_TEST})
         add_test(NAME gliner-benchmark
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_benchmark.py"
                 "${CMAKE_CURRENT_SOURCE_DIR}/convert/convert_hf_to_gguf.py"
@@ -145,7 +173,12 @@ if(BUILD_TESTING)
         list(APPEND GLINER_PARITY_TESTS gliner-benchmark)
         set(GLINER_PARITY_CHECKPOINT "" CACHE PATH "Optional real checkpoint for live Python parity")
         set(GLINER_PARITY_GGUF "" CACHE FILEPATH "Converted GGUF for live Python parity")
-        if(GLINER_PARITY_CHECKPOINT AND GLINER_PARITY_GGUF)
+        if(GLINER_PARITY_CHECKPOINT AND GLINER_PARITY_GGUF AND
+                GLINER_BUILD_METAL AND NOT GLINER_METAL_STRICT_F32)
+            message(STATUS "gliner: strict real-checkpoint parity is not registered for fast Metal mode")
+        endif()
+        if(GLINER_PARITY_CHECKPOINT AND GLINER_PARITY_GGUF AND
+                (NOT GLINER_BUILD_METAL OR GLINER_METAL_STRICT_F32))
             add_test(NAME gliner-real-parity
                 COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_parity.py"
                     --checkpoint "${GLINER_PARITY_CHECKPOINT}" --gguf "${GLINER_PARITY_GGUF}"
