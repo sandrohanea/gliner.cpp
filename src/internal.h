@@ -1,9 +1,11 @@
 #pragma once
 
+#include "gliner/gliner.h"
 #include <ggml.h>
 #include <ggml-backend.h>
 #include <gguf.h>
 #include <cstdint>
+#include <exception>
 #include <initializer_list>
 #include <memory>
 #include <optional>
@@ -13,9 +15,26 @@
 
 namespace gliner {
 
+class ModelReader {
+public:
+    ModelReader(const void * data, size_t size);
+    explicit ModelReader(const gliner_model_loader & loader, uint64_t size = UINT64_MAX);
+    uint64_t size() const { return size_; }
+    void read_at(void * output, uint64_t offset, size_t count);
+    void rethrow_error() const;
+    static size_t gguf_read(void * context, void * output, uint64_t offset, size_t count) noexcept;
+private:
+    void read_exact(void * output, size_t count);
+    const unsigned char * data_ = nullptr;
+    gliner_model_loader loader_ = {};
+    uint64_t size_;
+    uint64_t position_ = 0;
+    std::exception_ptr error_;
+};
+
 class GgufFile {
 public:
-    explicit GgufFile(const std::string & path);
+    explicit GgufFile(ModelReader & reader);
     ~GgufFile();
     GgufFile(const GgufFile &) = delete;
     GgufFile & operator=(const GgufFile &) = delete;
@@ -29,24 +48,30 @@ public:
     int tensor_count() const;
     ggml_tensor * tensor(ggml_context * ctx, const std::string & name,
                         std::initializer_list<int64_t> shape) const;
-    void load_weights(ggml_context * ctx) const;
+    void load_weights(ggml_context * ctx, ModelReader & reader) const;
 private:
     int64_t array(const char * key, gguf_type type) const;
-    std::string path_;
     gguf_context * ctx_ = nullptr;
 };
 
 struct Tokenized {
     std::vector<int32_t> ids;
     std::vector<int32_t> markers;
+    std::vector<gliner_task_result> tasks;
+};
+
+struct ClassificationTask {
+    std::string name;
+    std::vector<std::string> labels;
+    std::string prompt;
+    std::vector<std::optional<std::string>> descriptions;
 };
 
 class Tokenizer {
 public:
     explicit Tokenizer(const GgufFile & file);
-    Tokenized encode(const std::string & text, const std::string & task,
-                     const std::vector<std::string> & labels, const std::string & prompt,
-                     const std::vector<std::optional<std::string>> & descriptions, int max_words, int max_tokens) const;
+    Tokenized encode(const std::string & text, const std::vector<ClassificationTask> & tasks,
+                     int max_words, int max_tokens) const;
 private:
     struct Node {
         std::unordered_map<unsigned char, size_t> children;

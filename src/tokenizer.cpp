@@ -286,23 +286,11 @@ void Tokenizer::segment(const std::string & text, std::vector<int32_t> & ids) co
     }
 }
 
-Tokenized Tokenizer::encode(const std::string & text, const std::string & task,
-                           const std::vector<std::string> & labels, const std::string & prompt,
-                           const std::vector<std::optional<std::string>> & descriptions, int max_words, int max_tokens) const {
-    if (task.empty() || labels.empty()) throw std::invalid_argument("Task and labels are required");
-    std::string prompt_text = prompt.empty() ? task : task + ": " + prompt;
-    std::unordered_set<std::string> seen;
-    for (size_t i = 0; i < labels.size(); ++i) {
-        if (labels[i].empty() || !seen.insert(labels[i]).second) throw std::invalid_argument("Labels must be nonempty and unique");
-        if (labels[i] == "[SEP_TEXT]" || labels[i] == "[SEP_STRUCT]") {
-            throw std::invalid_argument("Schema separators cannot be used as label names");
-        }
-        if (!descriptions.empty() && descriptions[i]) {
-            prompt_text += " [DESCRIPTION] " + labels[i] + ": " + *descriptions[i];
-        }
-    }
-    if (prompt_text == "[SEP_TEXT]" || prompt_text == "[SEP_STRUCT]") {
-        throw std::invalid_argument("Schema separators cannot be used as task names");
+Tokenized Tokenizer::encode(const std::string & text, const std::vector<ClassificationTask> & tasks,
+                           int max_words, int max_tokens) const {
+    if (tasks.empty()) throw std::invalid_argument("Classification tasks are required");
+    if (tasks.size() > 1 && std::find(added_.begin(), added_.end(), "[SEP_STRUCT]") == added_.end()) {
+        throw std::runtime_error("Missing [SEP_STRUCT] token required for joint classification");
     }
     Tokenized result;
     auto emit = [&](const std::string & value) {
@@ -311,13 +299,38 @@ Tokenized Tokenizer::encode(const std::string & text, const std::string & task,
             throw std::invalid_argument("Token limit exceeded; use max_words to truncate text or increase max_tokens");
         }
     };
-    for (const auto & value : std::vector<std::string>{"(", "[P]", prompt_text, "("}) emit(value);
-    for (const auto & label : labels) {
-        result.markers.push_back(static_cast<int32_t>(result.ids.size()));
-        emit("[L]");
-        emit(label);
+    std::unordered_set<std::string> task_names;
+    for (const auto & task : tasks) {
+        if (task.name.empty() || !task_names.insert(task.name).second) {
+            throw std::invalid_argument("Task names must be nonempty and unique");
+        }
+        if (task.labels.empty()) throw std::invalid_argument("Each task requires labels");
+        std::string prompt_text = task.prompt.empty() ? task.name : task.name + ": " + task.prompt;
+        std::unordered_set<std::string> seen;
+        for (size_t i = 0; i < task.labels.size(); ++i) {
+            const auto & label = task.labels[i];
+            if (label.empty() || !seen.insert(label).second) throw std::invalid_argument("Labels must be nonempty and unique within each task");
+            if (label == "[SEP_TEXT]" || label == "[SEP_STRUCT]") {
+                throw std::invalid_argument("Schema separators cannot be used as label names");
+            }
+            if (!task.descriptions.empty() && task.descriptions[i]) {
+                prompt_text += " [DESCRIPTION] " + label + ": " + *task.descriptions[i];
+            }
+        }
+        if (prompt_text == "[SEP_TEXT]" || prompt_text == "[SEP_STRUCT]") {
+            throw std::invalid_argument("Schema separators cannot be used as task names");
+        }
+        if (!result.tasks.empty()) emit("[SEP_STRUCT]");
+        result.tasks.push_back({static_cast<int>(result.markers.size()), static_cast<int>(task.labels.size())});
+        for (const auto & value : std::vector<std::string>{"(", "[P]", prompt_text, "("}) emit(value);
+        for (const auto & label : task.labels) {
+            result.markers.push_back(static_cast<int32_t>(result.ids.size()));
+            emit("[L]");
+            emit(label);
+        }
+        emit(")"); emit(")");
     }
-    emit(")"); emit(")"); emit("[SEP_TEXT]");
+    emit("[SEP_TEXT]");
     for (const auto & word : words(text, max_words)) emit(word);
     return result;
 }

@@ -1,6 +1,7 @@
 #include "internal.h"
 
-#include <fstream>
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -8,21 +9,85 @@
 
 namespace gliner {
 
-GgufFile::GgufFile(const std::string & path) : path_(path) {
+ModelReader::ModelReader(const void * data, size_t size)
+    : data_(static_cast<const unsigned char *>(data)), size_(size) {}
+
+ModelReader::ModelReader(const gliner_model_loader & loader, uint64_t size)
+    : loader_(loader), size_(size) {}
+
+void ModelReader::read_exact(void * output, size_t count) {
+    if (position_ > size_ || count > size_ - position_) throw std::runtime_error("Truncated GGUF input");
+    auto * bytes = static_cast<unsigned char *>(output);
+    while (count) {
+        const size_t requested = std::min(count, size_t(8 * 1024 * 1024));
+        const size_t n = loader_.read(loader_.context, bytes, requested);
+        if (n > requested) throw std::runtime_error("Model loader returned more bytes than requested");
+        if (n == 0) {
+            throw std::runtime_error(loader_.eof(loader_.context) ?
+                "Unexpected end of GGUF stream" : "Model loader read failed (no progress before EOF)");
+        }
+        position_ += n;
+        bytes += n;
+        count -= n;
+    }
+}
+
+void ModelReader::read_at(void * output, uint64_t offset, size_t count) {
+    if (offset > size_ || count > size_ - offset) throw std::runtime_error("Truncated GGUF input");
+    if (data_) {
+        if (count) std::memcpy(output, data_ + static_cast<size_t>(offset), count);
+        return;
+    }
+    if (offset < position_) throw std::runtime_error("GGUF parser requested a nonsequential stream read");
+    if (offset > position_) {
+        std::array<unsigned char, 64 * 1024> discard;
+        while (position_ < offset) {
+            const size_t n = static_cast<size_t>(std::min<uint64_t>(discard.size(), offset - position_));
+            read_exact(discard.data(), n);
+        }
+    }
+    read_exact(output, count);
+}
+
+size_t ModelReader::gguf_read(void * context, void * output, uint64_t offset, size_t count) noexcept {
+    auto & reader = *static_cast<ModelReader *>(context);
+    if (reader.error_) return 0;
+    try {
+        reader.read_at(output, offset, count);
+        return count;
+    } catch (...) {
+        reader.error_ = std::current_exception();
+        return 0;
+    }
+}
+
+void ModelReader::rethrow_error() const {
+    if (error_) std::rethrow_exception(error_);
+}
+
+GgufFile::GgufFile(ModelReader & reader) {
     gguf_init_params params = {};
     params.no_alloc = true;
-    ctx_ = gguf_init_from_file(path.c_str(), params);
-    if (!ctx_) throw std::runtime_error("Cannot open GGUF: " + path);
+    ctx_ = gguf_init_from_callback(ModelReader::gguf_read, &reader, 8 * 1024 * 1024, reader.size(), params);
     try {
-        if (string("general.architecture") == "gliner2.5-decide") return;
+        reader.rethrow_error();
+        if (!ctx_) throw std::runtime_error("Cannot read GGUF metadata (invalid or truncated input)");
+        if (string("general.architecture") != "gliner2.5-decide") {
+            throw std::runtime_error("GGUF is not a GLiNER2.5-Decide checkpoint");
+        }
+        const uint64_t start = gguf_get_data_offset(ctx_);
+        for (int i = 0; i < tensor_count(); ++i) {
+            const uint64_t offset = gguf_get_tensor_offset(ctx_, i);
+            const uint64_t size = gguf_get_tensor_size(ctx_, i);
+            if (start > reader.size() || offset > reader.size() - start || size > reader.size() - start - offset) {
+                throw std::runtime_error("Truncated GGUF tensor payload");
+            }
+        }
     } catch (...) {
-        gguf_free(ctx_);
+        if (ctx_) gguf_free(ctx_);
         ctx_ = nullptr;
         throw;
     }
-    gguf_free(ctx_);
-    ctx_ = nullptr;
-    throw std::runtime_error("GGUF is not a GLiNER2.5-Decide checkpoint");
 }
 
 GgufFile::~GgufFile() { if (ctx_) gguf_free(ctx_); }
@@ -47,7 +112,11 @@ std::string GgufFile::string(const char * key) const {
     return gguf_get_val_str(ctx_, index);
 }
 
-int GgufFile::tensor_count() const { return static_cast<int>(gguf_get_n_tensors(ctx_)); }
+int GgufFile::tensor_count() const {
+    const int64_t count = gguf_get_n_tensors(ctx_);
+    if (count > std::numeric_limits<int>::max()) throw std::runtime_error("Too many GGUF tensors");
+    return static_cast<int>(count);
+}
 
 bool GgufFile::has(const char * key) const { return gguf_find_key(ctx_, key) >= 0; }
 
@@ -111,19 +180,16 @@ ggml_tensor * GgufFile::tensor(ggml_context * ctx, const std::string & name,
     return tensor;
 }
 
-void GgufFile::load_weights(ggml_context * ctx) const {
-    std::ifstream input(path_, std::ios::binary);
-    if (!input) throw std::runtime_error("Cannot reopen GGUF file");
+void GgufFile::load_weights(ggml_context * ctx, ModelReader & reader) const {
     std::vector<unsigned char> data(8 * 1024 * 1024);
-    for (auto * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
-        const int64_t id = gguf_find_tensor(ctx_, tensor->name);
-        input.seekg(static_cast<std::streamoff>(gguf_get_data_offset(ctx_) + gguf_get_tensor_offset(ctx_, id)));
-        const size_t bytes = ggml_nbytes(tensor);
+    for (int id = 0; id < tensor_count(); ++id) {
+        auto * tensor = ggml_get_tensor(ctx, gguf_get_tensor_name(ctx_, id));
+        const uint64_t start = gguf_get_data_offset(ctx_) + gguf_get_tensor_offset(ctx_, id);
+        const size_t bytes = gguf_get_tensor_size(ctx_, id);
         for (size_t offset = 0; offset < bytes;) {
             const size_t chunk = std::min(data.size(), bytes - offset);
-            input.read(reinterpret_cast<char *>(data.data()), static_cast<std::streamsize>(chunk));
-            if (!input) throw std::runtime_error(std::string("Cannot read tensor: ") + tensor->name);
-            ggml_backend_tensor_set(tensor, data.data(), offset, chunk);
+            reader.read_at(data.data(), start + offset, chunk);
+            if (tensor) ggml_backend_tensor_set(tensor, data.data(), offset, chunk);
             offset += chunk;
         }
     }
