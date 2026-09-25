@@ -68,6 +68,48 @@ struct gliner_task_result {
     int n_scores;
 };
 
+struct gliner_span_label {
+    const char * name; // unique, nonempty extraction label/group
+    const char * description; // optional description; empty string is distinct from NULL
+};
+
+struct gliner_span_params {
+    int n_threads;
+    int max_tokens; // combined schema + text limit, 1..4096; no automatic chunking
+    int max_words; // 0 means no word truncation
+    float threshold; // sigmoid probability cutoff, inclusive, 0..1
+    int max_spans_per_label; // 0 means unlimited; applied after overlap suppression
+    int allow_overlap; // 0: confidence-first greedy nonoverlap per label; 1: allow
+};
+
+struct gliner_span {
+    int label_index;
+    size_t start; // UTF-8 byte offsets into caller text, half-open [start, end)
+    size_t end;
+    float logit;
+    float probability;
+    const char * text; // exact source substring, owned by state
+};
+
+// Raw candidate diagnostics from the last successful extraction. End words are exclusive.
+// logits is label-major [n_labels, n_candidates]; candidate coordinates index text words.
+// Synthetic sentence punctuation is encoded but never returned as an extracted span.
+struct gliner_span_scores {
+    int n_labels;
+    int n_candidates;
+    int n_words;
+    int max_width;
+    int predicted_count; // upstream count gate: zero suppresses all entity results
+    const int32_t * label_positions; // n_labels contextual [E] marker positions
+    const int32_t * word_positions; // n_words first-subword positions in input_ids
+    const int32_t * start_words; // n_candidates
+    const int32_t * end_words; // n_candidates
+    const float * logits;
+    const float * count_logits; // 20 count classes
+};
+
+struct gliner_span_params gliner_default_span_params(void);
+
 // Optional diagnostic callback: layer 0 is embeddings; 1..n_layers are encoder outputs.
 // Values are row-major [n_tokens, hidden_size], valid only during the callback.
 // Called synchronously on the scoring thread. Do not re-enter this state from the callback.
@@ -95,6 +137,7 @@ int gliner_model_hidden_size(const struct gliner_context * ctx);
 int gliner_model_n_tensors(const struct gliner_context * ctx);
 int gliner_model_n_layers(const struct gliner_context * ctx);
 int gliner_model_supports_text(const struct gliner_context * ctx);
+int gliner_model_supports_spans(const struct gliner_context * ctx);
 // Fixed by GGML_CUDA/GGML_METAL at build time, not by an initialization parameter.
 // Returns "cpu", "cuda" or "metal" without initializing any devices.
 const char * gliner_build_backend(void);
@@ -140,15 +183,34 @@ int gliner_classify_text_batch(
     int n_tasks,
     const struct gliner_batch_params * params);
 
-// Task ranges for the last successful text call. Single-task calls expose one range.
+// Task ranges for the last successful classification call. Single-task calls expose one range.
 // NULL state, states-only calls and failed calls return 0/NULL. Results have the
 // same lifetime as scores. Repeated label names across different tasks are allowed.
 int gliner_n_tasks(const struct gliner_state * state);
 const struct gliner_task_result * gliner_get_task_results(const struct gliner_state * state);
 
-// Diagnostics from the last successful text call (empty after a states-only call or failure).
+// Grouped, verbatim entity/keyphrase extraction in one encoder pass, using upstream
+// entity schema semantics. Scores do not guarantee retrieval usefulness. Pointers are
+// borrowed only for this call; all inference results clear on failure or the next call.
+// Requires a checkpoint converted with span metadata. params may be NULL for defaults.
+int gliner_extract_spans(
+    const struct gliner_context * ctx,
+    struct gliner_state * state,
+    const char * text,
+    const struct gliner_span_label * labels,
+    int n_labels,
+    const struct gliner_span_params * params);
+
+// Results ordered by label index, then descending confidence and source position.
+// Classification/states-only calls and failed extraction clear these results.
+int gliner_n_spans(const struct gliner_state * state);
+const struct gliner_span * gliner_get_spans(const struct gliner_state * state);
+const struct gliner_span_scores * gliner_get_span_scores(const struct gliner_state * state);
+
+// Token IDs from the last successful classification/extraction (empty after states-only or failure).
 int gliner_n_tokens(const struct gliner_state * state);
 const int32_t * gliner_get_token_ids(const struct gliner_state * state);
+// Classification-only label diagnostics; extraction uses gliner_get_span_scores instead.
 const int32_t * gliner_get_label_positions(const struct gliner_state * state); // n_scores entries
 const float * gliner_get_label_states(const struct gliner_state * state); // n_scores * hidden_size
 

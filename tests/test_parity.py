@@ -66,6 +66,20 @@ KERNEL_CASES = [
     {"text": "a " * 20, "task": "a", "labels": ["a"]},
 ]
 
+SPAN_CASES = [
+    {"text": "Tim Cook works at Apple in California.", "labels": ["person", "company", "location"],
+     "descriptions": ["A person name", "A company name", "A location name"], "threshold": 0.5},
+    {"text": "Caf\u00e9 cafe\u0301 \u0130 \u039f\u03a3 \u4e2d\u6587 \U0001f680", "labels": ["thing", "other"],
+     "descriptions": ["A thing [E] mentioned in the text", ""], "threshold": 0., "top_k": 3},
+    {"text": "", "labels": ["thing"], "threshold": 0.},
+    {"text": "Email A.B@example.com or visit https://example.com", "labels": ["email", "URL"], "threshold": 0., "top_k": 2},
+    {"text": "hello world ignored words", "labels": ["term"], "max_words": 1, "threshold": 0., "allow_overlap": True},
+    {"text": "As of September 25, 2026, I am building a small Cloudflare Worker and need to verify two current platform limits. Consult the current official Cloudflare documentation rather than relying only on memory. (1) What is the maximum number of bound parameters in one Cloudflare D1 query, and would a single query with 120 bound parameters fit that limit? (2) What is the maximum combined number of recipients across to, cc, and bcc in one Cloudflare Email Sending message through the Workers binding, and would one message addressed to 60 total recipients fit that limit? Give both numeric limits and a yes/no for each proposed operation. Cite the official sources you used.",
+     "labels": ["D1 search term", "Email Sending search term"], "threshold": 0.3, "top_k": 5,
+     "descriptions": ["Words or short phrases needed to search official documentation for the Cloudflare D1 query bound parameter limit. Include the product name and the property whose limit is requested.",
+                      "Words or short phrases needed to search official documentation for the Cloudflare Email Sending combined recipient limit. Include the product name and the property whose limit is requested."]},
+]
+
 
 def load_oracle(checkpoint):
     config = DebertaV2Config.from_pretrained(checkpoint / "encoder_config")
@@ -95,6 +109,120 @@ def load_oracle(checkpoint):
                                         unk_token="[UNK]", pad_token="[PAD]",
                                         cls_token="[CLS]", sep_token="[SEP]", mask_token="[MASK]")
     return SchemaTransformer(tokenizer=tokenizer), encoder, classifier
+
+
+def load_span_oracle(checkpoint):
+    from gliner2.layers import CountLSTM, SpanRepLayer
+    processor, encoder, _ = load_oracle(checkpoint)
+    config = json.loads((checkpoint / "config.json").read_text(encoding="utf8"))
+    h, width = encoder.config.hidden_size, config["max_width"]
+    if config["counting_layer"] != "count_lstm" or config["span_head"]["span_mode"] != "markerV0":
+        raise ValueError("Unsupported span oracle configuration")
+    with torch.device("meta"):
+        span = SpanRepLayer(h, width, "markerV0", dropout=0)
+        count_embed = CountLSTM(h)
+        count_pred = torch.nn.Sequential(torch.nn.Linear(h, 2 * h), torch.nn.ReLU(), torch.nn.Linear(2 * h, 20))
+    modules = {"span_rep": span, "count_embed": count_embed, "count_pred": count_pred}
+    weights = {key: {} for key in modules}
+    index = checkpoint / "model.safetensors.index.json"
+    shards = sorted(set(json.loads(index.read_text())["weight_map"].values())) if index.exists() else ["model.safetensors"]
+    for shard in shards:
+        with safe_open(checkpoint / shard, framework="pt") as source:
+            for key in source.keys():
+                prefix, _, name = key.partition(".")
+                if prefix in weights:
+                    weights[prefix][name] = source.get_tensor(key)
+    for key, module in modules.items():
+        module.load_state_dict(weights[key], assign=True, strict=True)
+        module.float().eval()
+    return processor, encoder, span, count_embed, count_pred, width
+
+
+def span_reference(oracle, case):
+    from gliner2.inference.candidate_decoder import finalize_spans
+    processor, encoder, span, count_embed, count_pred, width = oracle
+    labels = case["labels"]
+    descs = {label: desc for label, desc in zip(labels, case.get("descriptions", []))}
+    schema = {"entities": {label: [] for label in labels}, "entity_descriptions": descs}
+    batch = processor.collate_fn_inference([(case["text"], schema)], max_len=case.get("max_words"), error_policy="raise")
+    with torch.inference_mode():
+        encoded = encoder(input_ids=batch.input_ids, attention_mask=batch.attention_mask).last_hidden_state
+        words, groups = processor.extract_embeddings_from_batch(encoded, batch.input_ids, batch)
+        n_words = words[0].shape[0]
+        starts, ends, dense = [], [], []
+        for start in range(n_words):
+            for w in range(width):
+                if start + w < n_words:
+                    starts.append(start)
+                    ends.append(start + w + 1)
+                    dense.append([start, start + w])
+                else:
+                    dense.append([0, 0])
+        all_spans = span(words[0].unsqueeze(0), torch.tensor([dense]))[0]
+        valid_spans = torch.stack([all_spans[s, e - s - 1] for s, e in zip(starts, ends)])
+        queries = torch.stack(groups[0][0])
+        count_logits = count_pred(queries[:1])[0]
+        predicted = int(count_logits.argmax())
+        projected = count_embed(queries[1:], 1)[0]
+        logits = torch.einsum("sh,qh->qs", valid_spans, projected)
+        probs = logits.sigmoid()
+    results = []
+    text = case["text"]
+    for label_index, label in enumerate(labels):
+        candidates, by_offset = [], {}
+        if predicted > 0:
+            for i, (s, e) in enumerate(zip(starts, ends)):
+                first = batch.start_mappings[0][s]
+                last_start = batch.start_mappings[0][e - 1]
+                end = min(len(text), batch.end_mappings[0][e - 1])
+                if first >= len(text) or last_start >= len(text) or probs[label_index, i] < case.get("threshold", 0.5):
+                    continue
+                start_byte, end_byte = len(text[:first].encode("utf8")), len(text[:end].encode("utf8"))
+                candidate = (text[first:end], float(probs[label_index, i]), start_byte, end_byte)
+                candidates.append(candidate)
+                by_offset[start_byte, end_byte] = float(logits[label_index, i])
+        selected = finalize_spans(candidates, suppress=not case.get("allow_overlap", False))
+        if case.get("top_k", 0):
+            selected = selected[:case["top_k"]]
+        results.append({"label": label, "spans": [
+            {"text": surface, "probability": probability, "start": start, "end": end,
+             "logit": by_offset[start, end]} for surface, probability, start, end in selected]})
+    return {"case": case, "input_ids": batch.input_ids[0].tolist(),
+            "label_positions": batch.schema_special_indices[0][0][1:],
+            "word_positions": batch.text_word_indices[0, :n_words].tolist(),
+            "start_words": starts, "end_words": ends,
+            "span_logits": logits.flatten().tolist(), "count_logits": count_logits.tolist(),
+            "predicted_count": predicted, "max_span_width": width, "groups": results}
+
+
+def compare_spans(binary, model, expected, tolerance, backend):
+    case = expected["case"]
+    command = [str(binary), "--model", str(model), "--text", case["text"], "--threads", "4", "--max-tokens", "2048", "--debug"]
+    for label in case["labels"]:
+        command += ["--label", label]
+    for label, desc in zip(case["labels"], case.get("descriptions", [])):
+        command += ["--description", label + "=" + desc]
+    for name, option in (("threshold", "--threshold"), ("top_k", "--top-k"), ("max_words", "--max-words")):
+        if name in case:
+            command += [option, str(case[name])]
+    if case.get("allow_overlap"):
+        command += ["--allow-overlap"]
+    actual = json.loads(subprocess.check_output(command, encoding="utf8"))
+    assert actual["backend"] == backend and actual["offset_unit"] == "utf8_bytes"
+    for key in ("input_ids", "label_positions", "word_positions", "start_words", "end_words", "predicted_count", "max_span_width"):
+        assert actual[key] == expected[key], key
+    for key in ("span_logits", "count_logits"):
+        np.testing.assert_allclose(actual[key], expected[key], atol=tolerance, rtol=tolerance, err_msg=key)
+    assert len(actual["groups"]) == len(expected["groups"])
+    for group, reference in zip(actual["groups"], expected["groups"]):
+        assert group["label"] == reference["label"]
+        assert [(x["text"], x["start"], x["end"]) for x in group["spans"]] == [
+            (x["text"], x["start"], x["end"]) for x in reference["spans"]], (group, reference)
+        for value, ref in zip(group["spans"], reference["spans"]):
+            np.testing.assert_allclose([value["logit"], value["probability"]], [ref["logit"], ref["probability"]],
+                                       atol=tolerance, rtol=tolerance)
+    error = max(abs(a - b) for a, b in zip(actual["span_logits"], expected["span_logits"]))
+    print(f"PASS spans {backend}: {len(actual['input_ids'])} tokens; {len(expected['span_logits'])} raw logits; max error {error:.8g}")
 
 
 def reference(oracle, case):
@@ -215,6 +343,7 @@ def main():
     group.add_argument("--batch-only", action="store_true", help="Run/write only joint-schema cases")
     group.add_argument("--single-only", action="store_true", help="Run/write only single-task cases")
     group.add_argument("--kernel-only", action="store_true", help="Generate/test short and long sequences with a 32-wide synthetic encoder")
+    group.add_argument("--spans-only", action="store_true", help="Generate/test grouped entity span extraction using gliner-extract")
     parser.add_argument("--case", type=int, action="append")
     parser.add_argument("--tolerance", type=float, default=3e-4)
     args = parser.parse_args()
@@ -236,16 +365,19 @@ def main():
         if checkpoint is None:
             checkpoint = directory
             create_checkpoint(checkpoint, hidden=32 if args.kernel_only else 8, layers=2,
-                              compact_tokens=args.kernel_only)
-        oracle = load_oracle(checkpoint)
-        cases = KERNEL_CASES if args.kernel_only else BATCH_CASES if args.batch_only else CASES if args.single_only else CASES + BATCH_CASES
+                              compact_tokens=args.kernel_only, spans=args.spans_only)
+        oracle = load_span_oracle(checkpoint) if args.spans_only else load_oracle(checkpoint)
+        cases = SPAN_CASES if args.spans_only else KERNEL_CASES if args.kernel_only else BATCH_CASES if args.batch_only else CASES if args.single_only else CASES + BATCH_CASES
         selected = cases if args.case is None else [cases[i] for i in args.case]
         fixtures = []
         for case in selected:
-            expected = reference(oracle, case)
+            expected = span_reference(oracle, case) if args.spans_only else reference(oracle, case)
             fixtures.append(expected)
             if args.binary and args.gguf:
-                compare(args.binary, args.gguf, expected, args.tolerance, directory, backend)
+                if args.spans_only:
+                    compare_spans(args.binary, args.gguf, expected, args.tolerance, backend)
+                else:
+                    compare(args.binary, args.gguf, expected, args.tolerance, directory, backend)
         if args.write_golden:
             args.write_golden.parent.mkdir(parents=True, exist_ok=True)
             args.write_golden.write_text(json.dumps({
@@ -254,7 +386,8 @@ def main():
                                "semantics_checked_at": "55656fbfa01d3d4a77485e1a1eeeaf682990ccdf",
                                "generator": "tests/test_parity.py " + ("--batch-only " if args.batch_only else
                                                                       "--single-only " if args.single_only else
-                                                                      "--kernel-only " if args.kernel_only else "") + "--write-golden"},
+                                                                      "--kernel-only " if args.kernel_only else
+                                                                      "--spans-only " if args.spans_only else "") + "--write-golden"},
                 "fixtures": fixtures}, separators=(",", ":")), encoding="utf8")
 
 

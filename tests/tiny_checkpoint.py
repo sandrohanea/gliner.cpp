@@ -16,7 +16,7 @@ def write_safetensors(path, tensors, dtype="F32"):
     path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + payload)
 
 
-def create_checkpoint(root, hidden=2, layers=1, dtype="F32", compact_tokens=False):
+def create_checkpoint(root, hidden=2, layers=1, dtype="F32", compact_tokens=False, spans=False):
     (root / "encoder_config").mkdir(exist_ok=True)
     config = {
         "model_type": "deberta-v2", "hidden_size": hidden, "num_hidden_layers": layers,
@@ -50,7 +50,11 @@ def create_checkpoint(root, hidden=2, layers=1, dtype="F32", compact_tokens=Fals
         "model": {"type": "Unigram", "unk_id": 3, "vocab": vocab, "byte_fallback": False},
     }
     config["vocab_size"] = len(vocab) + len(markers)
-    (root / "config.json").write_text(json.dumps({"architecture": "span", "token_pooling": "first"}), encoding="utf8")
+    model_config = {"architecture": "span", "token_pooling": "first"}
+    if spans:
+        model_config.update(max_width=8, counting_layer="count_lstm",
+                            span_head={"span_mode": "markerV0", "max_width": 8})
+    (root / "config.json").write_text(json.dumps(model_config), encoding="utf8")
     (root / "encoder_config" / "config.json").write_text(json.dumps(config), encoding="utf8")
     (root / "tokenizer.json").write_text(json.dumps(tokenizer), encoding="utf8")
     tensors = {}
@@ -89,7 +93,26 @@ def create_checkpoint(root, hidden=2, layers=1, dtype="F32", compact_tokens=Fals
             "classifier.2.weight": ([1, 4], [1, 2, -1, -2]),
             "classifier.2.bias": ([1], [0.5]),
         })
+    if spans:
+        for name in ("project_start", "project_end", "out_project"):
+            prefix = "span_rep.span_rep_layer." + name
+            tensor(prefix + ".0.weight", [4 * hidden, hidden * (2 if name == "out_project" else 1)])
+            tensor(prefix + ".0.bias", [4 * hidden])
+            tensor(prefix + ".3.weight", [hidden, 4 * hidden])
+            tensor(prefix + ".3.bias", [hidden])
+        tensor("count_pred.0.weight", [2 * hidden, hidden])
+        tensor("count_pred.0.bias", [2 * hidden])
+        tensors["count_pred.2.weight"] = ([20, 2 * hidden], [0.] * (40 * hidden))
+        tensors["count_pred.2.bias"] = ([20], [0., 1.] + [0.] * 18)
+        tensor("count_embed.pos_embedding.weight", [20, hidden])
+        for side in ("ih", "hh"):
+            tensor(f"count_embed.gru.weight_{side}_l0", [3 * hidden, hidden])
+            tensor(f"count_embed.gru.bias_{side}_l0", [3 * hidden])
+        tensor("count_embed.projector.0.weight", [4 * hidden, 2 * hidden])
+        tensor("count_embed.projector.0.bias", [4 * hidden])
+        tensor("count_embed.projector.2.weight", [hidden, 4 * hidden])
+        tensor("count_embed.projector.2.bias", [hidden])
     # Retained but never executed by the classification runtime.
-    tensors["span_rep.unused.weight"] = ([2, 3, 4], list(range(24)))
+    tensors["unused.span.weight" if spans else "span_rep.unused.weight"] = ([2, 3, 4], list(range(24)))
     write_safetensors(root / "model.safetensors", tensors, dtype)
     return tensors

@@ -1,6 +1,6 @@
 # gliner.cpp
 
-GGML/GGUF inference for [fastino/GLiNER2.5-Decide](https://huggingface.co/fastino/GLiNER2.5-Decide) text classification. CPU is the reference backend. Real-checkpoint F32 CUDA parity has been reported on an RTX 4060 Laptop GPU under the precision settings below, and F32 Metal parity has been verified on an Apple M4 Pro. Broader hardware, F16, memory, and performance validation remain pending. The CLI runs entirely in C++ from one GGUF file: schema construction, Unicode/Unigram tokenization, the 24-layer DeBERTa-v3-large encoder, contextual `[L]` marker gathering, and the shared classification head.
+GGML/GGUF inference for [fastino/GLiNER2.5-Decide](https://huggingface.co/fastino/GLiNER2.5-Decide) text classification and grouped span extraction. CPU is the reference backend. Classification F32 CUDA parity has been reported on an RTX 4060 Laptop GPU under the precision settings below, and classification F32 Metal parity has been verified on an Apple M4 Pro. Native span extraction has CPU reference coverage; its GPU validation remains pending. Inference runs entirely in C++ from one GGUF file, including schema/tokenization, the DeBERTa encoder and task heads.
 
 Despite its name, the published checkpoint uses the **span** architecture. Its classification head is `Linear(H, 2H)`, ReLU, `Linear(2H, 1)` on contextual marker states, not standalone label embeddings.
 
@@ -115,7 +115,7 @@ build/gliner-classify --model models/decide.gguf --inspect
 
 Conversion has no Python package dependencies. Once converted, distribute/use the GGUF with the native runtime; no checkpoint directory or Python environment is needed for inference. Checkpoints and GGUF outputs are ignored by Git.
 
-The converter is streaming and **standard-library-only**. It preserves every F32/F16 tensor, including unused span/counting weights, without quantization. It validates tensor shapes, dtypes, offsets, shard indexes, required encoder/classifier tensors and the supported tokenizer/encoder configuration. GGUF v3 contains application format version 2, including exact Unigram scores and Python Unicode lowercasing/word-character tables.
+The converter is streaming and **standard-library-only**. It preserves every F32/F16 tensor without quantization. It validates tensor shapes, dtypes, offsets, shard indexes, required encoder/classifier tensors and the supported tokenizer/encoder configuration. Checkpoints declaring a `markerV0` span head also require complete span, count-gate and `count_lstm` conditioning tensors. GGUF v3 contains application format version 2, including exact Unigram scores, Python Unicode lowercasing/word-character tables and additive span metadata where available.
 
 Older GGUF files remain usable with `--states`, but must be **reconverted** for text inference. Incomplete or unsupported version-2 models fail at load time rather than returning plausible scores.
 
@@ -186,6 +186,56 @@ The CLI loads the **model once** and reads the input file once. It joins schemas
 **Joint scores are not independent-call scores.** Tasks, labels and text all attend to one another; adding, removing or reordering a task may change another task's logits. This matches upstream's multi-task schema behavior. All schemas share the token budget; exceeding it fails rather than splitting or dropping tasks. A larger joint schema still increases attention memory and may not be faster than separate calls for every workload.
 
 This is one document with multiple questions, not a padded batch of multiple documents. In the C API, reuse the same context and state across requests to retain model weights and reuse scratch allocations. Input text is not cached across calls, and changing the schema requires a fresh encoder pass.
+
+## Grouped span extraction
+
+`gliner-extract` returns **verbatim substrings**, their half-open **UTF-8 byte offsets**, raw logits and sigmoid confidence, grouped by supplied extraction labels. All labels share one encoder pass and one loaded model. It follows upstream entity-schema scoring: contextual `[E]` markers, `markerV0` endpoint/output MLPs, the count gate and the first count-conditioned GRU/projector step. It is not the classification head applied to arbitrary words.
+
+Reconvert an existing checkpoint with the updated converter to include the required span metadata:
+
+```powershell
+python .\convert\convert_hf_to_gguf.py .\models\GLiNER2.5-Decide .\models\decide-spans.gguf
+.\build\Release\gliner-classify.exe --model .\models\decide-spans.gguf --inspect
+
+.\build\Release\gliner-extract.exe --model .\models\decide-spans.gguf `
+  --text "Tim Cook works at Apple in California." `
+  --labels person,company,location `
+  --description "person=A person name" `
+  --description "company=A company name" `
+  --description "location=A location name" --threads 4
+```
+
+This example matches upstream's `Tim Cook`, `Apple` and `California` spans. The output has a `groups` array in label order; each group contains `label` and `spans`, whose entries contain `text`, `start`, `end`, `logit` and `probability`. Empty groups remain present. `span_extraction: yes` in `--inspect` confirms model support. Older GGUF files still classify but cannot extract until reconverted, even if their span tensors were preserved.
+
+To request both search-term groups from one input:
+
+```powershell
+.\build\Release\gliner-extract.exe --model .\models\decide-spans.gguf `
+  --text-file .\request.txt `
+  --label "D1 search term" `
+  --description "D1 search term=Words or short phrases needed to search official documentation for the Cloudflare D1 query bound parameter limit. Include the product name and the property whose limit is requested." `
+  --label "Email Sending search term" `
+  --description "Email Sending search term=Words or short phrases needed to search official documentation for the Cloudflare Email Sending combined recipient limit. Include the product name and the property whose limit is requested." `
+  --threshold 0.3 --top-k 5 --threads 4
+```
+
+**Quality caveat:** Decide is classification-focused. For the Cloudflare request used during development, those search-term descriptions produced empty groups at threshold 0.3 in both upstream and C++; a broader `product` label returned `Cloudflare` rather than the full desired product names. Native parity does not guarantee useful search keywords. Label/schema tuning or an extraction-focused checkpoint may be needed. The runtime does not fetch documents, discover topic groups automatically, generate missing terms, normalize plurals, or assemble search queries.
+
+| Extraction option | Meaning |
+|---|---|
+| `--labels a,b` / repeated `--label NAME` | Unique extraction labels/groups, all evaluated together. |
+| `--description NAME=TEXT` | Optional per-label guidance, encoded in label order. |
+| `--threshold P` | Inclusive sigmoid cutoff in `[0,1]`, default 0.5. Confidence is not a calibrated retrieval-relevance score. |
+| `--top-k N` | Maximum returned spans per label **after** overlap suppression; 0 means all, the default. |
+| `--allow-overlap` | Disable confidence-first greedy overlap suppression within each label. Different labels may overlap regardless. |
+| `--max-tokens N` / `--max-words N` | Same aggregate token budget and explicit text-word truncation as classification. No silent truncation. |
+| `--debug` | Token IDs, label/word positions, candidate word ranges, all raw span/count logits and the predicted count. |
+
+Results are ordered by label, then descending confidence with source-position tie breaking. A predicted count of zero suppresses all results, matching the upstream entity gate. Only the first conditioning step is needed for entity lists, even when the gate predicts a larger count; repeated structured records/relations are not implemented.
+
+The published checkpoint permits spans of at most **8 upstream word/punctuation tokens**, not arbitrary-length summaries. Input must fit the schema-plus-text token budget (default 512, configurable up to 4096). This first version does **not** chunk long documents; exceeding the budget returns an error. `--max-words` is explicit truncation, not full-document extraction. The processor's synthetic terminal punctuation is encoded for parity but never returned as a standalone span; suffix offsets inside a URL are clipped to the original text.
+
+CPU checks compare all raw candidate logits, count logits/gate, token/marker/word positions and decoded spans against upstream on six cases, including Unicode, URLs, truncation, empty text and the Cloudflare example. Synthetic F32/F16 coverage is part of the existing integration suite. CUDA/Metal builds use the same GGML graph but require their own new span-path hardware checks; prior classification parity does not establish span parity.
 
 ## Performance benchmark
 
@@ -317,6 +367,33 @@ if (status == GLINER_STATUS_OK) {
 
 `gliner_get_scores` returns all labels flattened in task order, then label order. Each `gliner_task_result` is an offset/count into that array, also applicable to marker positions and contextual label states. `gliner_n_tasks`/`gliner_get_task_results` expose one range after the existing single-task API and none after states-only scoring or a failure. Result pointers expire at the next inference call or state destruction. C API probabilities remain independent sigmoid; apply softmax separately per task if desired. No additional model initialization is needed between calls.
 
+### Span extraction API
+
+Reuse a span-capable context and a state, just as for classification:
+
+```c
+const struct gliner_span_label labels[] = {
+    {"person", "A person name"},
+    {"company", "A company name"}
+};
+struct gliner_span_params options = gliner_default_span_params();
+options.n_threads = 4;
+options.max_spans_per_label = 5;
+int status = gliner_extract_spans(ctx, state, "Tim Cook works at Apple.",
+                                 labels, 2, &options);
+if (status == GLINER_STATUS_OK) {
+    const struct gliner_span * spans = gliner_get_spans(state);
+    for (int i = 0; i < gliner_n_spans(state); ++i) {
+        printf("%s: %s [%zu,%zu) %.6f\n", labels[spans[i].label_index].name,
+               spans[i].text, spans[i].start, spans[i].end, spans[i].probability);
+    }
+} else {
+    fprintf(stderr, "%s\n", gliner_last_error());
+}
+```
+
+`gliner_model_supports_spans` reports capability. Input pointers are borrowed for the call. Returned strings, arrays and `gliner_get_span_scores` diagnostic pointers are state-owned and valid until its next inference call or destruction. Offsets count UTF-8 bytes, not Unicode code points or UTF-16 code units. An empty match set is successful, not a fabricated fallback. Any failure clears results; switching between extraction and classification also clears the previous operation's results. Each state remains single-threaded; multiple states share immutable encoder and head weights.
+
 ### Initialize from a byte buffer
 
 ```c
@@ -357,8 +434,8 @@ Loading uses GGML's GGUF callback parser and at most 8 MiB tensor-transfer chunk
 
 ## Scope and remaining work
 
-Supported: one text with one or multiple jointly encoded classification tasks per call, ordered labels, per-task prompts and ordered label descriptions, exclusive argmax/softmax and independent multi-label thresholding, with the published Decide DeBERTa configuration.
+Supported: one text with jointly encoded classification tasks or grouped verbatim span labels per call; task/label descriptions; classification decoding and thresholded, overlap-resolved entity spans with the published Decide configuration.
 
-Not implemented: NER/span/JSON extraction, few-shot examples, constrained/beam/exact decision decoding, calibration fitting, automatic long-document chunking, alternate encoders/tokenizer pipelines, multi-document padded batching, quantization, memory-mapped weights, hybrid CPU/GPU offload or multi-GPU execution. Broader CUDA and Metal hardware validation remains pending. See [NEXT_STEPS.md](NEXT_STEPS.md).
+Not implemented: structured JSON/record/relation extraction, generated search queries, mixed classification/extraction in the same call, few-shot examples, constrained/beam/exact decision decoding, calibration fitting, automatic long-document chunking, alternate encoders/tokenizer pipelines, multi-document padded batching, quantization, memory-mapped weights, hybrid CPU/GPU offload or multi-GPU execution. Span GPU validation and broader hardware coverage remain pending. See [NEXT_STEPS.md](NEXT_STEPS.md).
 
 The model checkpoint is [Apache 2.0 licensed](https://huggingface.co/fastino/GLiNER2.5-Decide); review its license when redistributing converted weights. Checkpoints and generated GGUF files stay out of Git.

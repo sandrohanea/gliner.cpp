@@ -45,6 +45,77 @@ static void stream_close(void * context) {
     ((struct memory_stream *)context)->closes++;
 }
 
+static void span_layer(int layer, const float * values, int tokens, int hidden, void * context) {
+    int * count = (int *)context;
+    if (layer != *count || !values || tokens <= 0 || hidden <= 0) *count = -1000;
+    else ++*count;
+}
+
+static int test_spans(const char * path) {
+    struct gliner_context * ctx = gliner_init_from_file(path);
+    CHECK(ctx != NULL && gliner_model_supports_spans(ctx));
+    struct gliner_state * state = gliner_init_state(ctx);
+    CHECK(state != NULL);
+    const struct gliner_span_label labels[] = {{"person", "A person name"}, {"thing", NULL}};
+    const char * text = "Caf\xc3\xa9 Tim Cook works at Apple.";
+    struct gliner_span_params params = gliner_default_span_params();
+    params.threshold = 0;
+    params.max_spans_per_label = 1;
+    int calls = 0;
+    gliner_set_eval_callback(state, span_layer, &calls);
+    CHECK(gliner_extract_spans(ctx, state, text, labels, 2, &params) == GLINER_STATUS_OK);
+    CHECK(calls == gliner_model_n_layers(ctx) + 1);
+    gliner_set_eval_callback(state, NULL, NULL);
+    CHECK(gliner_n_spans(state) == 2);
+    CHECK(gliner_n_scores(state) == 0 && gliner_n_tasks(state) == 0);
+    CHECK(gliner_get_label_positions(state) == NULL && gliner_get_label_states(state) == NULL);
+    const struct gliner_span * result = gliner_get_spans(state);
+    CHECK(result != NULL);
+    for (int i = 0; i < 2; ++i) {
+        CHECK(result[i].label_index == i);
+        CHECK(result[i].start < result[i].end && result[i].end <= strlen(text));
+        CHECK(strlen(result[i].text) == result[i].end - result[i].start);
+        CHECK(memcmp(result[i].text, text + result[i].start, result[i].end - result[i].start) == 0);
+        CHECK(isfinite(result[i].logit) && result[i].probability >= 0 && result[i].probability <= 1);
+    }
+    const struct gliner_span_scores * raw = gliner_get_span_scores(state);
+    CHECK(raw && raw->n_labels == 2 && raw->predicted_count == 1 && raw->n_words > 0);
+    CHECK(raw->n_candidates > 0 && raw->max_width == 8);
+    CHECK(raw->label_positions[1] > raw->label_positions[0]);
+    for (int i = 0; i < raw->n_candidates; ++i) {
+        CHECK(raw->start_words[i] < raw->end_words[i] && raw->end_words[i] <= raw->n_words);
+        CHECK(raw->end_words[i] - raw->start_words[i] <= raw->max_width);
+    }
+    params.max_spans_per_label = 0;
+    params.allow_overlap = 1;
+    CHECK(gliner_extract_spans(ctx, state, text, labels, 2, &params) == GLINER_STATUS_OK);
+    CHECK(gliner_n_spans(state) > 2);
+    CHECK(gliner_extract_spans(ctx, state, "", labels, 2, &params) == GLINER_STATUS_OK);
+    CHECK(gliner_n_spans(state) == 0 && gliner_get_spans(state) == NULL);
+    CHECK(gliner_get_span_scores(state) != NULL);
+    params.max_tokens = 2;
+    CHECK(gliner_extract_spans(ctx, state, text, labels, 2, &params) == GLINER_STATUS_INVALID_ARGUMENT);
+    CHECK(gliner_get_span_scores(state) == NULL && gliner_n_tokens(state) == 0);
+    params = gliner_default_span_params();
+    params.threshold = NAN;
+    CHECK(gliner_extract_spans(ctx, state, text, labels, 2, &params) == GLINER_STATUS_INVALID_ARGUMENT);
+    CHECK(gliner_extract_spans(ctx, state, text, NULL, 2, NULL) == GLINER_STATUS_INVALID_ARGUMENT);
+    CHECK(gliner_extract_spans(ctx, state, text, labels, INT_MAX, NULL) == GLINER_STATUS_INVALID_ARGUMENT);
+    CHECK(gliner_extract_spans(ctx, state, "\xff", labels, 2, NULL) == GLINER_STATUS_INVALID_ARGUMENT);
+    const struct gliner_span_label duplicates[] = {{"same", NULL}, {"same", NULL}};
+    CHECK(gliner_extract_spans(ctx, state, text, duplicates, 2, NULL) == GLINER_STATUS_INVALID_ARGUMENT);
+    CHECK(gliner_extract_spans(ctx, state, text, labels, 2, NULL) == GLINER_STATUS_OK);
+    const char * classes[] = {"yes", "no"};
+    CHECK(gliner_classify_text(ctx, state, text, "intent", classes, 2, NULL) == GLINER_STATUS_OK);
+    CHECK(gliner_n_spans(state) == 0 && gliner_get_spans(state) == NULL && gliner_get_span_scores(state) == NULL);
+    CHECK(gliner_extract_spans(ctx, state, text, labels, 2, NULL) == GLINER_STATUS_OK);
+    CHECK(gliner_score_label_states(ctx, state, NULL, 1, 1) == GLINER_STATUS_INVALID_ARGUMENT);
+    CHECK(gliner_n_spans(state) == 0 && gliner_get_span_scores(state) == NULL);
+    gliner_free_state(state);
+    gliner_free(ctx);
+    return 0;
+}
+
 struct eval_count {
     int layers;
     int tokens;
@@ -258,10 +329,15 @@ static int test_loading(const char * path, struct gliner_context * reference) {
 }
 
 int main(int argc, char ** argv) {
+    if (argc == 3 && strcmp(argv[1], "--spans") == 0) return test_spans(argv[2]);
     CHECK(gliner_model_hidden_size(NULL) == 0);
     CHECK(gliner_model_n_tensors(NULL) == 0);
     CHECK(gliner_model_n_layers(NULL) == 0);
     CHECK(gliner_model_supports_text(NULL) == 0);
+    CHECK(gliner_model_supports_spans(NULL) == 0);
+    CHECK(gliner_n_spans(NULL) == 0);
+    CHECK(gliner_get_spans(NULL) == NULL);
+    CHECK(gliner_get_span_scores(NULL) == NULL);
     CHECK(gliner_model_backend_name(NULL) == NULL);
     CHECK(gliner_model_device_name(NULL) == NULL);
     CHECK(gliner_n_scores(NULL) == 0);

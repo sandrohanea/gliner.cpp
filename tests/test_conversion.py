@@ -293,7 +293,70 @@ def batch_contract(binary, model, root):
     failure(binary, model, *args, "--states", str(root / "states.txt"))
 
 
-def main(converter_path, executable, c_test, expected_backend=None, fast_metal=False):
+def span_contract(converter, extract, c_test, root, backend, fast_metal):
+    fixtures = json.loads((Path(__file__).parent / "fixtures" / "tiny_spans_parity.json").read_text(encoding="utf8"))["fixtures"]
+    for dtype in ("F32", "F16"):
+        tensors = create_checkpoint(root, hidden=8, layers=2, dtype=dtype, spans=True)
+        model = root / f"spans-{dtype}.gguf"
+        converter.convert(root, model)
+        preserved_tensors(model, tensors, dtype)
+        subprocess.run([c_test, "--spans", str(model)], check=True)
+        for expected in fixtures:
+            case = expected["case"]
+            args = ["--text", case["text"], "--debug", "--threads", "2", "--max-tokens", "2048"]
+            for label in case["labels"]:
+                args += ["--label", label]
+            for label, desc in zip(case["labels"], case.get("descriptions", [])):
+                args += ["--description", label + "=" + desc]
+            for name, option in (("threshold", "--threshold"), ("top_k", "--top-k"), ("max_words", "--max-words")):
+                if name in case:
+                    args += [option, str(case[name])]
+            if case.get("allow_overlap"):
+                args += ["--allow-overlap"]
+            actual = json.loads(run([extract], model, *args))
+            assert actual["backend"] == backend and actual["offset_unit"] == "utf8_bytes"
+            for key in ("input_ids", "label_positions", "word_positions", "start_words", "end_words", "max_span_width"):
+                assert actual[key] == expected[key], (dtype, key)
+            if not fast_metal:
+                tolerance = 5e-5 if dtype == "F32" else 5e-3
+                for key in ("span_logits", "count_logits"):
+                    assert_close(actual[key], expected[key], tolerance, f"{dtype} {key}")
+                assert actual["predicted_count"] == expected["predicted_count"]
+            assert len(actual["groups"]) == len(case["labels"])
+            source = case["text"].encode("utf8")
+            for group, reference in zip(actual["groups"], expected["groups"]):
+                assert group["label"] == reference["label"]
+                if dtype == "F32" and not fast_metal:
+                    assert [(s["text"], s["start"], s["end"]) for s in group["spans"]] == [
+                        (s["text"], s["start"], s["end"]) for s in reference["spans"]], (group, reference)
+                for span in group["spans"]:
+                    assert 0 <= span["start"] < span["end"] <= len(source)
+                    assert source[span["start"]:span["end"]].decode("utf8") == span["text"]
+        base = ["--text", "hello", "--labels", "a,b"]
+        for bad in (["--threshold", "-0.1"], ["--threshold", "1.1"], ["--threshold", "nan"],
+                    ["--top-k", "-1"], ["--threads", "0"], ["--max-tokens", "2"],
+                    ["--labels", "same,same"], ["--label", "extra"], ["--task", "unsupported"]):
+            failure([extract], model, *base, *bad)
+        closed = json.loads(run([extract], model, *base, "--threshold", "1"))
+        assert all(not group["spans"] for group in closed["groups"])
+    tensors["count_pred.2.bias"] = ([20], [2.] + [0.] * 19)
+    write_safetensors(root / "model.safetensors", tensors)
+    gated = root / "spans-gated.gguf"
+    converter.convert(root, gated)
+    result = json.loads(run([extract], gated, "--text", "hello", "--labels", "a,b", "--threshold", "0", "--debug"))
+    assert result["predicted_count"] == 0 and all(not g["spans"] for g in result["groups"])
+    del tensors["count_embed.gru.weight_ih_l0"]
+    write_safetensors(root / "model.safetensors", tensors)
+    try:
+        converter.convert(root, root / "spans-invalid.gguf")
+    except ValueError as error:
+        assert "count_embed.gru.weight_ih_l0" in str(error)
+    else:
+        raise AssertionError("Missing span-conditioning tensor accepted")
+    failure([extract], root / "model-F32.gguf", "--text", "hello", "--labels", "term")
+
+
+def main(converter_path, executable, c_test, expected_backend=None, fast_metal=False, extract=None):
     parity_environment_contract()
     spec = importlib.util.spec_from_file_location("converter", converter_path)
     converter = importlib.util.module_from_spec(spec)
@@ -361,6 +424,8 @@ def main(converter_path, executable, c_test, expected_backend=None, fast_metal=F
         large_model = root / "multi-chunk.gguf"
         converter.convert(root, large_model)
         subprocess.run([c_test, str(large_model), backend], check=True)
+        if extract:
+            span_contract(converter, extract, c_test, root, backend, fast_metal)
         negative_conversion(converter, binary, root)
     if fast_metal:
         print("Conversion, C API and CLI checks passed on fast Metal; strict encoder parity was not run")
@@ -375,5 +440,6 @@ if __name__ == "__main__":
     parser.add_argument("c_test")
     parser.add_argument("--expect-backend", choices=("cpu", "cuda", "metal"), help="Assert the binary's build backend; does not select it")
     parser.add_argument("--fast-metal", action="store_true", help="Skip strict encoder goldens for the intentional fast Metal build")
+    parser.add_argument("--extract", help="Native span extraction binary")
     args = parser.parse_args()
-    main(args.converter, args.binary, args.c_test, args.expect_backend, args.fast_metal)
+    main(args.converter, args.binary, args.c_test, args.expect_backend, args.fast_metal, args.extract)

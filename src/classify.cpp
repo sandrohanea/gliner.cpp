@@ -79,6 +79,7 @@ struct gliner_context {
     int tensors = 0;
     std::unique_ptr<gliner::Tokenizer> tokenizer;
     std::unique_ptr<gliner::Deberta> encoder;
+    std::unique_ptr<gliner::SpanHead> span_head;
 
     explicit gliner_context(gliner::ModelReader & reader)
         : device(select_device()), file(reader),
@@ -98,6 +99,7 @@ struct gliner_context {
             if (file.has("gliner.format_version")) {
                 encoder = std::make_unique<gliner::Deberta>(file, weights.value);
                 tokenizer = std::make_unique<gliner::Tokenizer>(file);
+                if (file.has("gliner.span_mode")) span_head = std::make_unique<gliner::SpanHead>(file, weights.value);
             }
             weight_buffer = ggml_backend_alloc_ctx_tensors(weights.value, backend);
             if (!weight_buffer) throw std::runtime_error(std::string("Cannot allocate model weights on ") + ggml_backend_dev_name(device));
@@ -124,6 +126,11 @@ struct gliner_state {
     std::vector<gliner_score> scores;
     gliner::Tokenized tokens;
     std::vector<float> label_states;
+    std::vector<gliner_span> spans;
+    std::vector<std::string> span_texts;
+    std::vector<int32_t> span_starts, span_ends;
+    std::vector<float> span_logits, count_logits;
+    gliner_span_scores span_scores = {};
     gliner_eval_callback callback = nullptr;
     void * callback_data = nullptr;
 
@@ -132,7 +139,16 @@ struct gliner_state {
         tokens.ids.clear();
         tokens.markers.clear();
         tokens.tasks.clear();
+        tokens.words.clear();
+        tokens.word_positions.clear();
         label_states.clear();
+        spans.clear();
+        span_texts.clear();
+        span_starts.clear();
+        span_ends.clear();
+        span_logits.clear();
+        count_logits.clear();
+        span_scores = {};
     }
 
     explicit gliner_state(const gliner_context * ctx) : owner(ctx) {
@@ -231,6 +247,47 @@ bool allocate_graph(gliner_state * state, ggml_cgraph * graph) {
     }
     return true;
 }
+
+void notify_layers(gliner_state * state, const std::vector<ggml_tensor *> & hidden, int n_tokens, int width) {
+    if (!state->callback) return;
+    std::vector<float> values(static_cast<size_t>(n_tokens) * width);
+    for (size_t i = 0; i < hidden.size(); ++i) {
+        ggml_backend_tensor_get(hidden[i], values.data(), 0, values.size() * sizeof(float));
+        state->callback(static_cast<int>(i), values.data(), n_tokens, width, state->callback_data);
+    }
+}
+
+struct EncoderGraph {
+    std::vector<int32_t> c2p, p2c;
+    size_t capacity;
+    GraphContext eval;
+    ggml_tensor * ids;
+    ggml_tensor * c2p_indices;
+    ggml_tensor * p2c_indices;
+    ggml_tensor * encoded;
+    std::vector<ggml_tensor *> hidden;
+
+    EncoderGraph(const gliner_context * ctx, const gliner::Tokenized & tokens, bool capture)
+        : capacity(static_cast<size_t>(ctx->layers + 1) * 160 + 512),
+          eval(ggml_tensor_overhead() * capacity * 2 + ggml_graph_overhead_custom(capacity, false)) {
+        ctx->encoder->relative_indices(static_cast<int>(tokens.ids.size()), c2p, p2c);
+        ids = input(static_cast<int64_t>(tokens.ids.size()));
+        c2p_indices = input(static_cast<int64_t>(c2p.size()));
+        p2c_indices = input(static_cast<int64_t>(p2c.size()));
+        encoded = ctx->encoder->build(eval.value, ids, c2p_indices, p2c_indices, hidden);
+        if (capture) for (auto * layer : hidden) ggml_set_output(layer);
+    }
+    ggml_tensor * input(int64_t size) {
+        auto * tensor = ggml_new_tensor_1d(eval.value, GGML_TYPE_I32, size);
+        ggml_set_input(tensor);
+        return tensor;
+    }
+    void upload(const gliner::Tokenized & tokens) {
+        ggml_backend_tensor_set(ids, tokens.ids.data(), 0, tokens.ids.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(c2p_indices, c2p.data(), 0, c2p.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(p2c_indices, p2c.data(), 0, p2c.size() * sizeof(int32_t));
+    }
+};
 
 } // namespace
 
@@ -340,6 +397,7 @@ int gliner_model_hidden_size(const struct gliner_context * ctx) { return ctx ? c
 int gliner_model_n_tensors(const struct gliner_context * ctx) { return ctx ? ctx->tensors : 0; }
 int gliner_model_n_layers(const struct gliner_context * ctx) { return ctx ? ctx->layers : 0; }
 int gliner_model_supports_text(const struct gliner_context * ctx) { return ctx && ctx->encoder ? 1 : 0; }
+int gliner_model_supports_spans(const struct gliner_context * ctx) { return ctx && ctx->span_head ? 1 : 0; }
 const char * gliner_model_backend_name(const struct gliner_context * ctx) {
     return ctx ? GLINER_COMPILED_BACKEND : nullptr;
 }
@@ -456,39 +514,22 @@ int gliner_classify_text_batch(const struct gliner_context * ctx, struct gliner_
         }
         auto tokens = ctx->tokenizer->encode(text, schema, options.max_words, options.max_tokens);
         const int n_tokens = static_cast<int>(tokens.ids.size());
-        std::vector<int32_t> c2p, p2c;
-        ctx->encoder->relative_indices(n_tokens, c2p, p2c);
-        const size_t capacity = static_cast<size_t>(ctx->layers + 1) * 160 + 256;
-        GraphContext eval(ggml_tensor_overhead() * capacity * 2 + ggml_graph_overhead_custom(capacity, false));
-        auto * ids = ggml_new_tensor_1d(eval.value, GGML_TYPE_I32, n_tokens);
-        auto * markers = ggml_new_tensor_1d(eval.value, GGML_TYPE_I32, n_labels);
-        auto * c2p_indices = ggml_new_tensor_1d(eval.value, GGML_TYPE_I32, static_cast<int64_t>(c2p.size()));
-        auto * p2c_indices = ggml_new_tensor_1d(eval.value, GGML_TYPE_I32, static_cast<int64_t>(p2c.size()));
-        for (auto * input : {ids, markers, c2p_indices, p2c_indices}) ggml_set_input(input);
-        std::vector<ggml_tensor *> hidden;
-        auto * encoded = ctx->encoder->build(eval.value, ids, c2p_indices, p2c_indices, hidden);
-        auto * label_states = ggml_get_rows(eval.value, encoded, markers);
+        EncoderGraph graph_data(ctx, tokens, state->callback != nullptr);
+        auto * eval = graph_data.eval.value;
+        auto * markers = graph_data.input(n_labels);
+        auto * label_states = ggml_get_rows(eval, graph_data.encoded, markers);
         ggml_set_output(label_states);
-        if (state->callback) for (auto * layer : hidden) ggml_set_output(layer);
-        auto * out = classification_graph(eval.value, ctx, label_states);
-        auto * graph = ggml_new_graph_custom(eval.value, capacity, false);
+        auto * out = classification_graph(eval, ctx, label_states);
+        auto * graph = ggml_new_graph_custom(eval, graph_data.capacity, false);
         ggml_build_forward_expand(graph, out);
         if (!allocate_graph(state, graph)) return GLINER_STATUS_BACKEND_ERROR;
-        ggml_backend_tensor_set(ids, tokens.ids.data(), 0, tokens.ids.size() * sizeof(int32_t));
+        graph_data.upload(tokens);
         ggml_backend_tensor_set(markers, tokens.markers.data(), 0, tokens.markers.size() * sizeof(int32_t));
-        ggml_backend_tensor_set(c2p_indices, c2p.data(), 0, c2p.size() * sizeof(int32_t));
-        ggml_backend_tensor_set(p2c_indices, p2c.data(), 0, p2c.size() * sizeof(int32_t));
         if (!compute(state, graph, options.n_threads)) return GLINER_STATUS_BACKEND_ERROR;
         collect_scores(state, out, static_cast<size_t>(n_labels));
         state->label_states.resize(static_cast<size_t>(n_labels) * ctx->hidden);
         ggml_backend_tensor_get(label_states, state->label_states.data(), 0, state->label_states.size() * sizeof(float));
-        if (state->callback) {
-            std::vector<float> values(static_cast<size_t>(n_tokens) * ctx->hidden);
-            for (size_t i = 0; i < hidden.size(); ++i) {
-                ggml_backend_tensor_get(hidden[i], values.data(), 0, values.size() * sizeof(float));
-                state->callback(static_cast<int>(i), values.data(), n_tokens, ctx->hidden, state->callback_data);
-            }
-        }
+        notify_layers(state, graph_data.hidden, n_tokens, ctx->hidden);
         state->tokens = std::move(tokens);
         return GLINER_STATUS_OK;
     } catch (const std::invalid_argument & error) {
@@ -506,6 +547,146 @@ int gliner_classify_text_batch(const struct gliner_context * ctx, struct gliner_
     }
 }
 
+struct gliner_span_params gliner_default_span_params(void) {
+    return {1, 512, 0, 0.5f, 0, 0};
+}
+
+int gliner_extract_spans(const struct gliner_context * ctx, struct gliner_state * state,
+                         const char * text, const struct gliner_span_label * labels,
+                         int n_labels, const struct gliner_span_params * params) {
+    clear_error();
+    if (state) state->clear();
+    const auto options = params ? *params : gliner_default_span_params();
+    if (!ctx || !state || state->owner != ctx || !text || !labels || n_labels <= 0 ||
+        options.n_threads <= 0 || options.max_tokens <= 0 || options.max_tokens > 4096 ||
+        n_labels > options.max_tokens || options.max_words < 0 || options.max_spans_per_label < 0 ||
+        (options.allow_overlap != 0 && options.allow_overlap != 1) ||
+        !std::isfinite(options.threshold) || options.threshold < 0 || options.threshold > 1) {
+        set_error("Invalid span extraction arguments");
+        return GLINER_STATUS_INVALID_ARGUMENT;
+    }
+    if (!ctx->span_head) {
+        set_error("Model has no supported span metadata; reconvert a markerV0/count_lstm checkpoint");
+        return GLINER_STATUS_MODEL_ERROR;
+    }
+    try {
+        const std::string source(text);
+        gliner::ClassificationTask schema;
+        schema.name = "entities";
+        for (int i = 0; i < n_labels; ++i) {
+            if (!labels[i].name) throw std::invalid_argument("NULL extraction label");
+            schema.labels.emplace_back(labels[i].name);
+            if (labels[i].description) schema.descriptions.emplace_back(labels[i].description);
+            else schema.descriptions.emplace_back(std::nullopt);
+        }
+        auto tokens = ctx->tokenizer->encode(source, {schema}, options.max_words, options.max_tokens, true);
+        const int n_words = static_cast<int>(tokens.words.size());
+        std::vector<int32_t> starts, ends;
+        for (int start = 0; start < n_words; ++start) {
+            for (int width = 1; width <= ctx->span_head->max_width && start + width <= n_words; ++width) {
+                starts.push_back(start);
+                ends.push_back(start + width - 1);
+            }
+        }
+        EncoderGraph data(ctx, tokens, state->callback != nullptr);
+        auto * eval = data.eval.value;
+        auto * word_ids = data.input(n_words);
+        auto * label_ids = data.input(n_labels);
+        auto * prompt = data.input(1);
+        auto * start_ids = data.input(static_cast<int64_t>(starts.size()));
+        auto * end_ids = data.input(static_cast<int64_t>(ends.size()));
+        auto * count_index = data.input(1);
+        ggml_tensor * count_out = nullptr;
+        auto * out = ctx->span_head->build(eval, data.encoded, word_ids, label_ids, prompt, start_ids, end_ids, count_index, count_out);
+        ggml_set_output(out);
+        ggml_set_output(count_out);
+        auto * graph = ggml_new_graph_custom(eval, data.capacity, false);
+        ggml_build_forward_expand(graph, count_out);
+        ggml_build_forward_expand(graph, out);
+        if (!allocate_graph(state, graph)) return GLINER_STATUS_BACKEND_ERROR;
+        data.upload(tokens);
+        ggml_backend_tensor_set(word_ids, tokens.word_positions.data(), 0, tokens.word_positions.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(label_ids, tokens.markers.data(), 0, tokens.markers.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(prompt, &tokens.prompt_position, 0, sizeof(int32_t));
+        ggml_backend_tensor_set(start_ids, starts.data(), 0, starts.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(end_ids, ends.data(), 0, ends.size() * sizeof(int32_t));
+        const int32_t zero = 0;
+        ggml_backend_tensor_set(count_index, &zero, 0, sizeof(zero));
+        if (!compute(state, graph, options.n_threads)) return GLINER_STATUS_BACKEND_ERROR;
+        state->span_logits.resize(starts.size() * static_cast<size_t>(n_labels));
+        state->count_logits.resize(20);
+        ggml_backend_tensor_get(out, state->span_logits.data(), 0, state->span_logits.size() * sizeof(float));
+        ggml_backend_tensor_get(count_out, state->count_logits.data(), 0, state->count_logits.size() * sizeof(float));
+        for (float value : state->span_logits) if (!std::isfinite(value)) throw std::runtime_error("Nonfinite span logits");
+        for (float value : state->count_logits) if (!std::isfinite(value)) throw std::runtime_error("Nonfinite count logits");
+        const int predicted = static_cast<int>(std::max_element(state->count_logits.begin(), state->count_logits.end()) - state->count_logits.begin());
+        if (predicted > 0) {
+            for (int label = 0; label < n_labels; ++label) {
+                std::vector<gliner_span> candidates, selected;
+                for (size_t i = 0; i < starts.size(); ++i) {
+                    const auto & first = tokens.words[starts[i]];
+                    const auto & last = tokens.words[ends[i]];
+                    // Drop synthetic suffix tokens; offsets for a suffix inside a URL are clipped.
+                    if (first.start == first.end || last.start == last.end) continue;
+                    const float logit = state->span_logits[static_cast<size_t>(label) * starts.size() + i];
+                    const float probability = sigmoid(logit);
+                    if (probability >= options.threshold) candidates.push_back({label, first.start, last.end, logit, probability, nullptr});
+                }
+                std::stable_sort(candidates.begin(), candidates.end(), [](const gliner_span & a, const gliner_span & b) {
+                    if (a.probability != b.probability) return a.probability > b.probability;
+                    if (a.start != b.start) return a.start < b.start;
+                    return a.end < b.end;
+                });
+                for (const auto & candidate : candidates) {
+                    if (!options.allow_overlap && std::any_of(selected.begin(), selected.end(), [&](const gliner_span & other) {
+                        return candidate.start < other.end && other.start < candidate.end;
+                    })) continue;
+                    selected.push_back(candidate);
+                    if (options.max_spans_per_label && selected.size() == static_cast<size_t>(options.max_spans_per_label)) break;
+                }
+                state->spans.insert(state->spans.end(), selected.begin(), selected.end());
+            }
+        }
+        state->span_texts.reserve(state->spans.size());
+        for (auto & span : state->spans) {
+            state->span_texts.push_back(source.substr(span.start, span.end - span.start));
+            span.text = state->span_texts.back().c_str();
+        }
+        notify_layers(state, data.hidden, static_cast<int>(tokens.ids.size()), ctx->hidden);
+        tokens.tasks.clear();
+        state->tokens = std::move(tokens);
+        state->span_starts = std::move(starts);
+        state->span_ends = std::move(ends);
+        for (auto & end : state->span_ends) ++end;
+        state->span_scores = {n_labels, static_cast<int>(state->span_starts.size()), n_words, ctx->span_head->max_width,
+                             predicted, state->tokens.markers.data(), state->tokens.word_positions.data(),
+                             state->span_starts.data(), state->span_ends.data(), state->span_logits.data(), state->count_logits.data()};
+        return GLINER_STATUS_OK;
+    } catch (const std::invalid_argument & error) {
+        state->clear();
+        set_error(error.what());
+        return GLINER_STATUS_INVALID_ARGUMENT;
+    } catch (const std::exception & error) {
+        state->clear();
+        set_error(error.what());
+        return GLINER_STATUS_MODEL_ERROR;
+    } catch (...) {
+        state->clear();
+        set_error("Unknown span extraction error");
+        return GLINER_STATUS_MODEL_ERROR;
+    }
+}
+
+int gliner_n_spans(const struct gliner_state * state) {
+    return state ? static_cast<int>(state->spans.size()) : 0;
+}
+const struct gliner_span * gliner_get_spans(const struct gliner_state * state) {
+    return state && !state->spans.empty() ? state->spans.data() : nullptr;
+}
+const struct gliner_span_scores * gliner_get_span_scores(const struct gliner_state * state) {
+    return state && state->span_scores.n_labels > 0 ? &state->span_scores : nullptr;
+}
+
 int gliner_n_tasks(const struct gliner_state * state) {
     return state ? static_cast<int>(state->tokens.tasks.size()) : 0;
 }
@@ -520,7 +701,7 @@ const int32_t * gliner_get_token_ids(const struct gliner_state * state) {
     return state && !state->tokens.ids.empty() ? state->tokens.ids.data() : nullptr;
 }
 const int32_t * gliner_get_label_positions(const struct gliner_state * state) {
-    return state && !state->tokens.markers.empty() ? state->tokens.markers.data() : nullptr;
+    return state && !state->scores.empty() && !state->tokens.markers.empty() ? state->tokens.markers.data() : nullptr;
 }
 const float * gliner_get_label_states(const struct gliner_state * state) {
     return state && !state->label_states.empty() ? state->label_states.data() : nullptr;

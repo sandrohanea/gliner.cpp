@@ -134,9 +134,15 @@ std::string Tokenizer::lowercase(const std::vector<int32_t> & word) const {
     return result;
 }
 
-std::vector<std::string> Tokenizer::words(const std::string & text, int max_words) const {
+std::vector<Word> Tokenizer::words(const std::string & text, int max_words) const {
     auto chars = codepoints(text);
+    std::vector<size_t> offsets{0};
+    for (int32_t cp : chars) {
+        uint8_t bytes[4];
+        offsets.push_back(offsets.back() + static_cast<size_t>(utf8proc_encode_char(cp, bytes)));
+    }
     if (chars.empty() || (chars.back() != '.' && chars.back() != '!' && chars.back() != '?')) chars.push_back('.');
+    if (offsets.size() == chars.size()) offsets.push_back(text.size());
     std::string shadow;
     for (int32_t cp : chars) {
         if (flags(cp) & 2) shadow += ' ';
@@ -149,7 +155,7 @@ std::vector<std::string> Tokenizer::words(const std::string & text, int max_word
     auto letter = [](char c) { return c >= 'a' && c <= 'z'; };
     auto digit = [](char c) { return c >= '0' && c <= '9'; };
     auto alnum = [&](char c) { return letter(c) || digit(c); };
-    std::vector<std::string> result;
+    std::vector<Word> result;
     for (size_t i = 0; i < chars.size() && (!max_words || result.size() < static_cast<size_t>(max_words));) {
         if (flags(chars[i]) & 2) { ++i; continue; }
         size_t special_end = i;
@@ -187,7 +193,7 @@ std::vector<std::string> Tokenizer::words(const std::string & text, int max_word
                 else break;
             }
         }
-        result.push_back(lowercase(std::vector<int32_t>(chars.begin() + i, chars.begin() + end)));
+        result.push_back({lowercase(std::vector<int32_t>(chars.begin() + i, chars.begin() + end)), offsets[i], offsets[end]});
         i = end;
     }
     return result;
@@ -287,8 +293,11 @@ void Tokenizer::segment(const std::string & text, std::vector<int32_t> & ids) co
 }
 
 Tokenized Tokenizer::encode(const std::string & text, const std::vector<ClassificationTask> & tasks,
-                           int max_words, int max_tokens) const {
+                           int max_words, int max_tokens, bool entities) const {
     if (tasks.empty()) throw std::invalid_argument("Classification tasks are required");
+    if (entities && std::find(added_.begin(), added_.end(), "[E]") == added_.end()) {
+        throw std::runtime_error("Missing [E] token required for span extraction");
+    }
     if (tasks.size() > 1 && std::find(added_.begin(), added_.end(), "[SEP_STRUCT]") == added_.end()) {
         throw std::runtime_error("Missing [SEP_STRUCT] token required for joint classification");
     }
@@ -322,16 +331,28 @@ Tokenized Tokenizer::encode(const std::string & text, const std::vector<Classifi
         }
         if (!result.tasks.empty()) emit("[SEP_STRUCT]");
         result.tasks.push_back({static_cast<int>(result.markers.size()), static_cast<int>(task.labels.size())});
-        for (const auto & value : std::vector<std::string>{"(", "[P]", prompt_text, "("}) emit(value);
+        emit("(");
+        result.prompt_position = static_cast<int32_t>(result.ids.size());
+        emit("[P]"); emit(prompt_text); emit("(");
         for (const auto & label : task.labels) {
             result.markers.push_back(static_cast<int32_t>(result.ids.size()));
-            emit("[L]");
+            emit(entities ? "[E]" : "[L]");
             emit(label);
         }
         emit(")"); emit(")");
     }
     emit("[SEP_TEXT]");
-    for (const auto & word : words(text, max_words)) emit(word);
+    for (const auto & word : words(text, max_words)) {
+        const auto position = static_cast<int32_t>(result.ids.size());
+        emit(word.text);
+        if (entities) {
+            if (result.ids.size() == static_cast<size_t>(position)) {
+                throw std::invalid_argument("Text word produced no subwords; span alignment would be ambiguous");
+            }
+            result.word_positions.push_back(position);
+            result.words.push_back(word);
+        }
+    }
     return result;
 }
 

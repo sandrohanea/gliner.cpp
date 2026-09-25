@@ -203,6 +203,28 @@ def encoder_shapes(encoder):
     return shapes
 
 
+def span_shapes(hidden):
+    shapes = {}
+
+    def linear(name, width, height):
+        shapes[name + ".weight"] = (height, width)
+        shapes[name + ".bias"] = (height,)
+
+    for name in ("project_start", "project_end", "out_project"):
+        prefix = "span_rep.span_rep_layer." + name
+        linear(prefix + ".0", hidden * (2 if name == "out_project" else 1), 4 * hidden)
+        linear(prefix + ".3", 4 * hidden, hidden)
+    linear("count_pred.0", hidden, 2 * hidden)
+    linear("count_pred.2", 2 * hidden, 20)
+    shapes["count_embed.pos_embedding.weight"] = (20, hidden)
+    for side in ("ih", "hh"):
+        shapes[f"count_embed.gru.weight_{side}_l0"] = (3 * hidden, hidden)
+        shapes[f"count_embed.gru.bias_{side}_l0"] = (3 * hidden,)
+    linear("count_embed.projector.0", 2 * hidden, 4 * hidden)
+    linear("count_embed.projector.2", 4 * hidden, hidden)
+    return shapes
+
+
 def metadata(directory):
     model_config = read_json(directory / "config.json")
     if model_config.get("architecture") != "span":
@@ -298,6 +320,19 @@ def metadata(directory):
     shapes = encoder_shapes(encoder)
     shapes.update({"classifier.0.weight": (2 * h, h), "classifier.0.bias": (2 * h,),
                    "classifier.2.weight": (1, 2 * h), "classifier.2.bias": (1,)})
+    if "span_head" in model_config:
+        head = model_config["span_head"]
+        width = head.get("max_width")
+        if head.get("span_mode") != "markerV0" or model_config.get("counting_layer") != "count_lstm":
+            raise ValueError("Span extraction supports markerV0 with count_lstm only")
+        if type(width) is not int or not 1 <= width <= 128 or model_config.get("max_width") != width:
+            raise ValueError("Invalid or inconsistent span max_width")
+        if "[E]" not in added_tokens:
+            raise ValueError("Missing structural token [E]")
+        kv += [("gliner.span_mode", KV_STRING, "markerV0"),
+               ("gliner.max_width", KV_U32, width),
+               ("gliner.counting_layer", KV_STRING, "count_lstm")]
+        shapes.update(span_shapes(h))
     return kv, shapes
 
 

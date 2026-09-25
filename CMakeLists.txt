@@ -104,6 +104,7 @@ add_library(gliner STATIC
     src/gguf.cpp
     src/classify.cpp
     src/tokenizer.cpp
+    src/span.cpp
     src/deberta.cpp)
 target_include_directories(gliner PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(gliner PUBLIC ${GLINER_GGML_TARGET} PRIVATE gliner_unicode)
@@ -119,6 +120,8 @@ endif()
 
 add_executable(gliner-classify examples/classify.cpp examples/main.cpp)
 target_link_libraries(gliner-classify PRIVATE gliner)
+add_executable(gliner-extract examples/extract.cpp examples/main.cpp)
+target_link_libraries(gliner-extract PRIVATE gliner)
 add_executable(gliner-bench examples/bench.cpp examples/main.cpp)
 target_link_libraries(gliner-bench PRIVATE gliner)
 target_compile_definitions(gliner-bench PRIVATE
@@ -127,6 +130,7 @@ target_compile_definitions(gliner-bench PRIVATE
     GLINER_BENCH_METAL_PRECISION_MODE="${GLINER_METAL_PRECISION_MODE}")
 if(MINGW)
     target_link_options(gliner-classify PRIVATE -municode)
+    target_link_options(gliner-extract PRIVATE -municode)
     target_link_options(gliner-bench PRIVATE -municode)
 endif()
 
@@ -135,6 +139,7 @@ if(BUILD_TESTING)
     option(GLINER_PYTHON_TESTS "Run standard-library conversion and CLI integration tests when Python is available" ON)
     set(GLINER_PARITY_CHECKPOINT "" CACHE PATH "Optional real checkpoint for live Python parity")
     set(GLINER_PARITY_GGUF "" CACHE FILEPATH "Converted GGUF for live Python parity")
+    set(GLINER_SPAN_PARITY_GGUF "" CACHE FILEPATH "Optional reconverted span-enabled GGUF for upstream extraction parity")
     add_executable(gliner-test tests/test_core.c)
     target_link_libraries(gliner-test PRIVATE gliner)
     set_target_properties(gliner-test PROPERTIES LINKER_LANGUAGE CXX C_STANDARD 11 C_STANDARD_REQUIRED YES C_EXTENSIONS OFF)
@@ -175,6 +180,7 @@ if(BUILD_TESTING)
                     "${CMAKE_CURRENT_SOURCE_DIR}/convert/convert_hf_to_gguf.py"
                     "$<TARGET_FILE:gliner-classify>"
                     "$<TARGET_FILE:gliner-test>" --expect-backend "${GLINER_COMPILED_BACKEND}"
+                    --extract "$<TARGET_FILE:gliner-extract>"
                     ${GLINER_CONVERSION_OPTIONS})
         set_tests_properties(${GLINER_CONVERSION_TEST} PROPERTIES LABELS "${GLINER_CONVERSION_LABELS}" TIMEOUT 600)
         list(APPEND GLINER_PARITY_TESTS ${GLINER_CONVERSION_TEST})
@@ -197,6 +203,15 @@ if(BUILD_TESTING)
                     --binary "$<TARGET_FILE:gliner-classify>" --expect-backend "${GLINER_COMPILED_BACKEND}")
             set_tests_properties(gliner-real-parity PROPERTIES LABELS "parity;model;${GLINER_COMPILED_BACKEND}" TIMEOUT 600)
             list(APPEND GLINER_PARITY_TESTS gliner-real-parity)
+        endif()
+        if(GLINER_PARITY_CHECKPOINT AND GLINER_SPAN_PARITY_GGUF AND
+                (NOT GLINER_BUILD_METAL OR GLINER_METAL_STRICT_F32))
+            add_test(NAME gliner-real-span-parity
+                COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_parity.py"
+                    --checkpoint "${GLINER_PARITY_CHECKPOINT}" --gguf "${GLINER_SPAN_PARITY_GGUF}"
+                    --binary "$<TARGET_FILE:gliner-extract>" --spans-only --expect-backend "${GLINER_COMPILED_BACKEND}")
+            set_tests_properties(gliner-real-span-parity PROPERTIES LABELS "parity;spans;${GLINER_COMPILED_BACKEND}" TIMEOUT 600)
+            list(APPEND GLINER_PARITY_TESTS gliner-real-span-parity)
         endif()
     endif()
     if(GLINER_COMPILED_BACKEND STREQUAL "cuda")

@@ -181,6 +181,7 @@ int run(const std::vector<std::string> & args) {
                       << "tensors: " << gliner_model_n_tensors(model.get()) << '\n'
                       << "hidden_size: " << gliner_model_hidden_size(model.get()) << '\n'
                       << "encoder_layers: " << gliner_model_n_layers(model.get()) << '\n'
+                      << "span_extraction: " << (gliner_model_supports_spans(model.get()) ? "yes" : "no (reconversion may be required)") << '\n'
                       << "backend: " << gliner_model_backend_name(model.get()) << '\n'
                       << "device: " << gliner_model_device_name(model.get()) << '\n'
                       << "text_inference: " << (gliner_model_supports_text(model.get()) ? "yes" : "no (legacy GGUF)") << '\n';

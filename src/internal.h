@@ -54,10 +54,19 @@ private:
     gguf_context * ctx_ = nullptr;
 };
 
+struct Word {
+    std::string text;
+    size_t start;
+    size_t end;
+};
+
 struct Tokenized {
     std::vector<int32_t> ids;
     std::vector<int32_t> markers;
     std::vector<gliner_task_result> tasks;
+    std::vector<Word> words;
+    std::vector<int32_t> word_positions;
+    int32_t prompt_position = 0;
 };
 
 struct ClassificationTask {
@@ -71,7 +80,7 @@ class Tokenizer {
 public:
     explicit Tokenizer(const GgufFile & file);
     Tokenized encode(const std::string & text, const std::vector<ClassificationTask> & tasks,
-                     int max_words, int max_tokens) const;
+                     int max_words, int max_tokens, bool entities = false) const;
 private:
     struct Node {
         std::unordered_map<unsigned char, size_t> children;
@@ -86,10 +95,25 @@ private:
     double unknown_score_;
     unsigned flags(int32_t cp) const;
     std::string lowercase(const std::vector<int32_t> & word) const;
-    std::vector<std::string> words(const std::string & text, int max_words) const;
+    std::vector<Word> words(const std::string & text, int max_words) const;
     std::string normalize(const std::string & text) const;
     void unigram(const std::string & text, std::vector<int32_t> & ids) const;
     void segment(const std::string & text, std::vector<int32_t> & ids) const;
+};
+
+class SpanHead {
+public:
+    SpanHead(const GgufFile & file, ggml_context * weights);
+    ggml_tensor * build(ggml_context * ctx, ggml_tensor * encoded, ggml_tensor * words,
+                       ggml_tensor * labels, ggml_tensor * prompt, ggml_tensor * starts,
+                       ggml_tensor * ends, ggml_tensor * count_index, ggml_tensor *& count_logits) const;
+    int hidden;
+    int max_width;
+private:
+    std::unordered_map<std::string, ggml_tensor *> tensors_;
+    ggml_tensor * linear(ggml_context * ctx, ggml_tensor * x, const std::string & name) const;
+    ggml_tensor * projection(ggml_context * ctx, ggml_tensor * x, const std::string & name,
+                            const char * final_layer) const;
 };
 
 class Deberta {
