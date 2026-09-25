@@ -16,7 +16,7 @@ def write_safetensors(path, tensors, dtype="F32"):
     path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + payload)
 
 
-def create_checkpoint(root, hidden=2, layers=1, dtype="F32"):
+def create_checkpoint(root, hidden=2, layers=1, dtype="F32", compact_tokens=False):
     (root / "encoder_config").mkdir(exist_ok=True)
     config = {
         "model_type": "deberta-v2", "hidden_size": hidden, "num_hidden_layers": layers,
@@ -30,6 +30,8 @@ def create_checkpoint(root, hidden=2, layers=1, dtype="F32"):
     pieces = ["[PAD]", "[CLS]", "[SEP]", "[UNK]", "\u2581"]
     pieces += list("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.!?,:()/@+%")
     pieces += ["\u2581hello", "\u2581world", "hello", "ll", "\u00e9", "\u03c3", "\u03c2", "\u4e2d", "\u6587"]
+    if compact_tokens:
+        pieces += ["\u2581(", "\u2581)", "\u2581.", "\u2581a"]
     markers = ["[MASK]", "[SEP_STRUCT]", "[SEP_TEXT]", "[P]", "[C]", "[E]", "[R]",
                "[L]", "[EXAMPLE]", "[OUTPUT]", "[DESCRIPTION]"]
     vocab = [[piece, 0.0 if i < 4 else -1.0 - (i % 7) * 0.125] for i, piece in enumerate(pieces)]

@@ -3,15 +3,20 @@
 
 import importlib.util
 import argparse
+import contextlib
+import io
 import json
 import math
+import os
 import struct
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 from tiny_checkpoint import create_checkpoint, write_safetensors
+from parity_environment import configure_parity_environment
 
 
 def run(binary, model, *args):
@@ -28,7 +33,29 @@ def failure(binary, model, *args):
 def assert_close(actual, expected, tolerance, context):
     assert len(actual) == len(expected), (context, len(actual), len(expected))
     for index, (a, b) in enumerate(zip(actual, expected)):
-        assert math.isfinite(a) and abs(a - b) <= tolerance * (1 + abs(b)), (context, index, a, b)
+        allowed = tolerance * (1 + abs(b))
+        if not math.isfinite(a) or abs(a - b) > allowed:
+            raise AssertionError(
+                f"{context}: index {index}, actual={a:.9g}, expected={b:.9g}, "
+                f"absolute_error={abs(a - b):.9g}, allowed={allowed:.9g}")
+
+def parity_environment_contract():
+    original = dict(os.environ)
+    with patch.dict(os.environ, {"NVIDIA_TF32_OVERRIDE": "1", "GGML_CUDA_CUBLAS_COMPUTE_TYPE": "f16"}):
+        before = dict(os.environ)
+        for backend in ("cpu", "metal"):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                configure_parity_environment(backend)
+            assert dict(os.environ) == before and not output.getvalue(), backend
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            configure_parity_environment("cuda")
+        assert os.environ["NVIDIA_TF32_OVERRIDE"] == "0"
+        assert os.environ["GGML_CUDA_CUBLAS_COMPUTE_TYPE"] == "f32"
+        assert "NVIDIA_TF32_OVERRIDE=0" in output.getvalue()
+        assert "GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32" in output.getvalue()
+    assert dict(os.environ) == original
 
 
 def preserved_tensors(path, tensors, dtype):
@@ -78,15 +105,19 @@ def offline_parity(converter, binary, root, backend):
     fixtures = []
     for name in ("tiny_parity.json", "tiny_batch_parity.json"):
         fixtures += json.loads((Path(__file__).parent / "fixtures" / name).read_text(encoding="utf8"))["fixtures"]
-    for dtype in ("F32", "F16"):
-        tensors = create_checkpoint(root, hidden=8, layers=2, dtype=dtype)
-        model = root / f"parity-{dtype}.gguf"
+    kernel_fixtures = json.loads((Path(__file__).parent / "fixtures" / "tiny_cuda_parity.json").read_text(encoding="utf8"))["fixtures"]
+    assert 3 < len(kernel_fixtures[0]["input_ids"]) <= 16
+    assert len(kernel_fixtures[1]["input_ids"]) > 16
+    groups = [(8, False, fixtures), (32, True, kernel_fixtures)]
+    for dtype, width, compact, group in [(dtype, *group) for group in groups for dtype in ("F32", "F16")]:
+        tensors = create_checkpoint(root, hidden=width, layers=2, dtype=dtype, compact_tokens=compact)
+        model = root / f"parity-{width}-{dtype}.gguf"
         converter.convert(root, model)
         preserved_tensors(model, tensors, dtype)
         tolerance = 5e-5 if dtype == "F32" else 5e-3
-        for index, expected in enumerate(fixtures):
+        for index, expected in enumerate(group):
             case = expected["case"]
-            dump = root / f"hidden-{dtype}-{index}.f32"
+            dump = root / f"hidden-{width}-{dtype}-{index}.f32"
             args = ["--text", case["text"], "--threads", "2",
                     "--max-tokens", "2048", "--debug", "--dump-hidden", str(dump)]
             for task in case.get("tasks", [case]):
@@ -105,12 +136,24 @@ def offline_parity(converter, binary, root, backend):
                         args += ["--" + name, str(task[name])]
             if "max_words" in case:
                 args += ["--max-words", str(case["max_words"])]
+            context = f"{backend}, {dtype}, hidden_size {width}, fixture {index}"
+            print(f"Checking {context}", flush=True)
             actual = json.loads(run(binary, model, *args))
             assert actual["backend"] == backend, actual["backend"]
             assert actual["device"], "Missing execution device"
             assert actual["input_ids"] == expected["input_ids"], (case, actual["input_ids"], expected["input_ids"])
             assert actual["label_positions"] == expected["label_positions"], case
-            assert_close(actual["label_states"], [v for row in expected["label_states"] for v in row], tolerance, "label states")
+            data = dump.read_bytes()
+            n_tokens, hidden = struct.unpack_from("<II", data)
+            assert n_tokens == len(expected["input_ids"]) and hidden == width
+            outputs = struct.unpack("<" + "f" * ((len(data) - 8) // 4), data[8:])
+            assert len(outputs) == len(expected["hidden_states"]) * n_tokens * hidden
+            for layer, reference in enumerate(expected["hidden_states"]):
+                begin = layer * n_tokens * hidden
+                assert_close(outputs[begin:begin + n_tokens * hidden], [v for row in reference for v in row],
+                             tolerance, f"{context}, encoder layer {layer}")
+            assert_close(actual["label_states"], [v for row in expected["label_states"] for v in row],
+                         tolerance, f"{context}, label states")
             if "tasks" in expected:
                 assert len(actual["tasks"]) == len(expected["tasks"])
                 assert actual["task_offsets"] == expected["task_offsets"]
@@ -125,17 +168,8 @@ def offline_parity(converter, binary, root, backend):
                 winner = max(range(len(case["labels"])), key=lambda i: expected["logits"][i])
                 assert actual["label"] == case["labels"][winner]
                 assert actual["task_offsets"] == [0, len(case["labels"])]
-            assert_close([s["logit"] for s in scores], expected["logits"], tolerance, "logits")
-            assert_close([s["probability"] for s in scores], expected["probabilities"], tolerance, "probabilities")
-            data = dump.read_bytes()
-            n_tokens, hidden = struct.unpack_from("<II", data)
-            assert n_tokens == len(expected["input_ids"]) and hidden == 8
-            outputs = struct.unpack("<" + "f" * ((len(data) - 8) // 4), data[8:])
-            assert len(outputs) == len(expected["hidden_states"]) * n_tokens * hidden
-            for layer, reference in enumerate(expected["hidden_states"]):
-                begin = layer * n_tokens * hidden
-                assert_close(outputs[begin:begin + n_tokens * hidden], [v for row in reference for v in row],
-                             tolerance, f"encoder layer {layer}, {dtype}, fixture {index}")
+            assert_close([s["logit"] for s in scores], expected["logits"], tolerance, f"{context}, logits")
+            assert_close([s["probability"] for s in scores], expected["probabilities"], tolerance, f"{context}, probabilities")
 
 
 def negative_conversion(converter, binary, root):
@@ -260,6 +294,7 @@ def batch_contract(binary, model, root):
 
 
 def main(converter_path, executable, c_test, expected_backend=None):
+    parity_environment_contract()
     spec = importlib.util.spec_from_file_location("converter", converter_path)
     converter = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = converter
@@ -268,6 +303,7 @@ def main(converter_path, executable, c_test, expected_backend=None):
     assert backend in ("cpu", "cuda", "metal"), backend
     if expected_backend is not None:
         assert backend == expected_backend, (backend, expected_backend)
+    configure_parity_environment(backend)
     binary = [executable]
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)

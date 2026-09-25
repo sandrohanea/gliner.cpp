@@ -38,7 +38,7 @@ Read the binary's fixed backend without loading a checkpoint or initializing a d
 
 Output is JSON, for example `{"backend":"cpu"}`. At initialization the runtime uses the first available device of that compiled backend. `--inspect` and `--debug` report the backend and the actual device. Switching backends requires using another build.
 
-The model's weights, all state scratch buffers and graph operations use that device. Tokenization remains on the CPU. GPU matrix multiplications request F32 accumulation; `--threads` controls CPU execution only. There is **no silent CPU fallback**, partial offload or multi-GPU splitting. A missing device, allocation failure or unsupported operation is an error. Weights plus inference scratch must fit on the device; the real F32 model alone needs roughly 1.8 GiB, and attention memory grows quadratically with token count.
+The model's weights, all state scratch buffers and graph operations use that device. Tokenization remains on the CPU. GPU matrix multiplications request F32 activation inputs and accumulation; `--threads` controls CPU execution only. There is **no silent CPU fallback**, partial offload or multi-GPU splitting. A missing device, allocation failure or unsupported operation is an error. Weights plus inference scratch must fit on the device; the real F32 model alone needs roughly 1.8 GiB, and attention memory grows quadratically with token count.
 
 For an explicit CPU build on any platform:
 
@@ -52,10 +52,22 @@ cmake --build build-cpu --config Release -j
 ```powershell
 cmake -S . -B build-cuda -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DGGML_METAL=OFF
 cmake --build build-cuda --config Release -j
+$env:NVIDIA_TF32_OVERRIDE = "0"
+$env:GGML_CUDA_CUBLAS_COMPUTE_TYPE = "f32"
 .\build-cuda\Release\gliner-classify.exe --model .\models\decide.gguf --task intent --labels refund_request,other --text "Refund my order"
 ```
 
 For a single-configuration generator, omit `Release` from the executable path. Use `CMAKE_CUDA_ARCHITECTURES` when targeting a specific GPU architecture.
+
+**CUDA precision requirement:** the pinned GGML cuBLAS backend enables TF32 math, even when graph operations request F32 accumulation. TF32 can round multiplication inputs enough to exceed the F32 parity tolerance. Set `NVIDIA_TF32_OVERRIDE=0` **before launching the application** to disable it; setting `GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32` also prevents an inherited GGML override from selecting F16/BF16 cuBLAS computation. On Linux, prefix the invocation with `NVIDIA_TF32_OVERRIDE=0 GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32`.
+
+The CLI and C library do not modify their host's process-wide CUDA environment. Applications embedding gliner must set these variables before initializing CUDA/cuBLAS, including through other libraries. Running without these settings retains GGML's faster reduced-precision defaults and is not covered by the strict parity claim. Disabling TF32 may reduce throughput.
+
+The synthetic CUDA suite was reported passing on an **RTX 4060 Laptop GPU (compute capability 8.9, 8 GiB VRAM)** with TF32 disabled. The same build failed an F32 golden hidden-state comparison with TF32 enabled. Real-checkpoint CUDA parity remains pending; tolerances were not relaxed.
+
+**Short-sequence CUDA fix:** the pinned GGML also has a custom small-matrix (MMF) kernel using explicit TF32 instructions, outside cuBLAS. The cuBLAS environment override does not affect it. A real 22-token case passed on the RTX 4060 with those settings, but the 12-token case failed at encoder layer 1. CMake now builds a generated copy of GGML's CUDA dispatch file that bypasses MMF when F32 activation inputs are requested, allowing the FP32-capable cuBLAS path instead. The original GGML source checkout is not modified. This targeted build-directory fix requires local/fetched GGML source; prebuilt CUDA GGML packages are rejected until an upstream equivalent can be relied on. Unknown dispatch layouts fail configuration rather than silently omitting the fix. CPU and Metal builds do not use the overlay.
+
+After updating these changes, **reconfigure and rebuild** the CUDA build; changing only the environment does not repair an older binary's MMF dispatch. Configuration prints `gliner: applied CUDA F32-input precision fix in the build directory`. Keep the cuBLAS precision environment settings as well. The new 32-wide synthetic fixtures test sequences below and above the small-matrix cutoff; hardware confirmation of the rebuilt runtime is still required.
 
 **Metal (Apple GPUs, macOS):** use the Xcode command-line tools and Metal toolchain:
 
@@ -66,7 +78,7 @@ cmake --build build-metal -j
 
 Run that build's `gliner-classify` with the normal model/task/text arguments; it uses Metal without an additional flag. Embedding the Metal library avoids a separate shader-file deployment step.
 
-`GGML_CUDA`/`GGML_METAL` configure **local or fetched GGML source builds** and fix gliner's execution backend. An installed GGML must already include the requested backend; configuration fails if its CMake package reports otherwise. Unconfigured bare GGML libraries are supported only for CPU builds. Neither CUDA nor Metal has been run in this Windows CPU-only environment. Their release gates are tracked separately in [NEXT_STEPS.md](NEXT_STEPS.md).
+`GGML_CUDA`/`GGML_METAL` configure **local or fetched GGML source builds** and fix gliner's execution backend. Installed GGML remains supported for CPU/Metal; its package must include the requested backend. CUDA currently requires GGML source for the precision fix described above. Unconfigured bare GGML libraries are supported only for CPU builds. Neither CUDA nor Metal has been run in this Windows CPU-only environment. Their release gates are tracked separately in [NEXT_STEPS.md](NEXT_STEPS.md).
 
 ## Convert
 
@@ -157,6 +169,8 @@ Token IDs, marker positions and task score offsets match exactly. All 25 hidden-
 
 The normal CTest suite needs no ML dependencies or downloaded weights. It replays checked-in, deterministic single-task and joint-schema goldens on a complete tiny encoder, checks F32/F16 storage, the C ABI, task grouping/decoding, conversion preservation and error paths. A callback-count assertion verifies one encoder traversal per multi-task call. It also compares file, buffer and non-seekable short-read stream initialization for both single-task and joint inference, including source lifetimes, malformed/truncated input and loader cleanup. Tiny F32 uses `atol=rtol=5e-5`; F16 storage is compared to F32 goldens with `5e-3`. **Real-checkpoint F16 parity has not been established.**
 
+`tiny_cuda_parity.json` adds 32-wide encoder fixtures with 10- and 30-token inputs, covering CUDA's short-matrix dispatch boundary that the original 8-wide fixtures could not exercise. Regenerate them with `tests/test_parity.py --kernel-only --write-golden tests/fixtures/tiny_cuda_parity.json`. The source-overlay configuration test runs without a GPU and checks that the GGML checkout remains unchanged; it is not a substitute for GPU numerical parity.
+
 For the optional live oracle, use a separate Python 3.12 environment:
 
 ```sh
@@ -167,7 +181,9 @@ python tests/test_parity.py --checkpoint models/GLiNER2.5-Decide \
 
 To include that comparison in CTest, configure `GLINER_PARITY_CHECKPOINT` and `GLINER_PARITY_GGUF` with absolute paths and select the oracle environment with `Python3_EXECUTABLE`. The oracle runs all 13 cases by default; `--single-only` and `--batch-only` select a subset. Regenerate synthetic fixtures with `tests/test_parity.py --single-only --write-golden tests/fixtures/tiny_parity.json` or `--batch-only --write-golden tests/fixtures/tiny_batch_parity.json`; provenance is stored inside each fixture.
 
-Parity runs use the binary's compiled backend. Both scripts accept `--expect-backend cpu|cuda|metal` to assert which build is under test; this option does not select or change the backend. CTest supplies that assertion automatically. Keep separate CPU/CUDA/Metal build directories and run CTest in each; a GPU build without its required device fails rather than skipping. GPU tests initially enforce the same tolerances as CPU; hardware-specific tolerances must be measured and documented before changing them. No GPU speedup or real-checkpoint parity is claimed yet.
+Parity runs use the binary's compiled backend. Both scripts accept `--expect-backend cpu|cuda|metal` to assert which build is under test; this option does not select or change the backend. CTest supplies that assertion automatically. CUDA CTest runs and standalone parity scripts explicitly set `NVIDIA_TF32_OVERRIDE=0` and `GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32` for their child processes, without changing the invoking shell. CPU/Metal runs leave those environment settings alone.
+
+Keep separate CPU/CUDA/Metal build directories and run CTest in each; a GPU build without its required device fails rather than skipping. The synthetic parity test reports backend, storage dtype, fixture, first failing encoder layer and the numerical error/allowed error. Layer 0 is embeddings. GPU tests enforce the same tolerances as CPU; hardware-specific tolerances must be measured and documented before changing them. No GPU speedup or real-checkpoint parity is claimed yet. Malformed-GGUF messages from negative loader tests are expected; a traceback or CTest failure is not.
 
 For classification-head-only comparisons, export contextual states with the upstream model:
 

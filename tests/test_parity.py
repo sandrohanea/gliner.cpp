@@ -20,6 +20,7 @@ from safetensors import safe_open
 from transformers import DebertaV2Config, DebertaV2Model, PreTrainedTokenizerFast
 
 from tiny_checkpoint import create_checkpoint
+from parity_environment import configure_parity_environment
 
 
 CASES = [
@@ -59,6 +60,11 @@ BATCH_CASES = [
     ]},
 ]
 BATCH_CASES.append({"text": BATCH_CASES[0]["text"], "tasks": list(reversed(BATCH_CASES[0]["tasks"]))})
+
+KERNEL_CASES = [
+    {"text": "", "task": "a", "labels": ["a"]},
+    {"text": "a " * 20, "task": "a", "labels": ["a"]},
+]
 
 
 def load_oracle(checkpoint):
@@ -205,6 +211,7 @@ def main():
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--batch-only", action="store_true", help="Run/write only joint-schema cases")
     group.add_argument("--single-only", action="store_true", help="Run/write only single-task cases")
+    group.add_argument("--kernel-only", action="store_true", help="Generate/test short and long sequences with a 32-wide synthetic encoder")
     parser.add_argument("--case", type=int, action="append")
     parser.add_argument("--tolerance", type=float, default=3e-4)
     args = parser.parse_args()
@@ -218,15 +225,17 @@ def main():
         assert backend in ("cpu", "cuda", "metal"), backend
         if args.expect_backend is not None:
             assert backend == args.expect_backend, (backend, args.expect_backend)
+        configure_parity_environment(backend)
     torch.set_num_threads(4)
     with tempfile.TemporaryDirectory() as temp:
         directory = Path(temp)
         checkpoint = args.checkpoint
         if checkpoint is None:
             checkpoint = directory
-            create_checkpoint(checkpoint, hidden=8, layers=2)
+            create_checkpoint(checkpoint, hidden=32 if args.kernel_only else 8, layers=2,
+                              compact_tokens=args.kernel_only)
         oracle = load_oracle(checkpoint)
-        cases = BATCH_CASES if args.batch_only else CASES if args.single_only else CASES + BATCH_CASES
+        cases = KERNEL_CASES if args.kernel_only else BATCH_CASES if args.batch_only else CASES if args.single_only else CASES + BATCH_CASES
         selected = cases if args.case is None else [cases[i] for i in args.case]
         fixtures = []
         for case in selected:
@@ -241,7 +250,8 @@ def main():
                                "transformers": transformers.__version__, "torch": torch.__version__,
                                "semantics_checked_at": "55656fbfa01d3d4a77485e1a1eeeaf682990ccdf",
                                "generator": "tests/test_parity.py " + ("--batch-only " if args.batch_only else
-                                                                      "--single-only " if args.single_only else "") + "--write-golden"},
+                                                                      "--single-only " if args.single_only else
+                                                                      "--kernel-only " if args.kernel_only else "") + "--write-golden"},
                 "fixtures": fixtures}, separators=(",", ":")), encoding="utf8")
 
 

@@ -63,6 +63,11 @@ else()
     endif()
 endif()
 
+if(GLINER_BUILD_CUDA)
+    include(cmake/GgmlCudaPrecision.cmake)
+    gliner_fix_cuda_precision()
+endif()
+
 find_path(UTF8PROC_INCLUDE_DIR utf8proc.h)
 find_library(UTF8PROC_LIBRARY NAMES utf8proc_static utf8proc)
 if(UTF8PROC_INCLUDE_DIR AND UTF8PROC_LIBRARY)
@@ -110,14 +115,19 @@ if(BUILD_TESTING)
     target_link_libraries(gliner-test PRIVATE gliner)
     set_target_properties(gliner-test PROPERTIES LINKER_LANGUAGE CXX C_STANDARD 11 C_STANDARD_REQUIRED YES C_EXTENSIONS OFF)
     add_test(NAME gliner-core COMMAND gliner-test)
+    set(GLINER_PARITY_TESTS gliner-core)
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME gliner-cuda-precision-config
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cuda_precision_config.py"
+                "${CMAKE_COMMAND}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GgmlCudaPrecision.cmake")
         add_test(NAME gliner-conversion
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_conversion.py"
                     "${CMAKE_CURRENT_SOURCE_DIR}/convert/convert_hf_to_gguf.py"
                     "$<TARGET_FILE:gliner-classify>"
                     "$<TARGET_FILE:gliner-test>" --expect-backend "${GLINER_COMPILED_BACKEND}")
         set_tests_properties(gliner-conversion PROPERTIES LABELS "parity;${GLINER_COMPILED_BACKEND}" TIMEOUT 600)
+        list(APPEND GLINER_PARITY_TESTS gliner-conversion)
         set(GLINER_PARITY_CHECKPOINT "" CACHE PATH "Optional real checkpoint for live Python parity")
         set(GLINER_PARITY_GGUF "" CACHE FILEPATH "Converted GGUF for live Python parity")
         if(GLINER_PARITY_CHECKPOINT AND GLINER_PARITY_GGUF)
@@ -126,6 +136,12 @@ if(BUILD_TESTING)
                     --checkpoint "${GLINER_PARITY_CHECKPOINT}" --gguf "${GLINER_PARITY_GGUF}"
                     --binary "$<TARGET_FILE:gliner-classify>" --expect-backend "${GLINER_COMPILED_BACKEND}")
             set_tests_properties(gliner-real-parity PROPERTIES LABELS "parity;model;${GLINER_COMPILED_BACKEND}" TIMEOUT 600)
+            list(APPEND GLINER_PARITY_TESTS gliner-real-parity)
         endif()
+    endif()
+    if(GLINER_COMPILED_BACKEND STREQUAL "cuda")
+        # F32 accumulation alone does not disable the pinned GGML cuBLAS TF32 math mode.
+        set_tests_properties(${GLINER_PARITY_TESTS} PROPERTIES
+            ENVIRONMENT "NVIDIA_TF32_OVERRIDE=0;GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32")
     endif()
 endif()

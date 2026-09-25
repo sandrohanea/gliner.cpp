@@ -198,10 +198,11 @@ bool compute(gliner_state * state, ggml_cgraph * graph, int n_threads) {
 bool allocate_graph(gliner_state * state, ggml_cgraph * graph) {
     for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
         auto * node = ggml_graph_node(graph, i);
-        if (node->op == GGML_OP_MUL_MAT && ggml_backend_dev_type(state->owner->device) != GGML_BACKEND_DEVICE_TYPE_CPU &&
-            !ggml_prec_set_acc(node, GGML_PREC_F32)) {
-            set_error("Cannot request F32 matrix accumulation");
-            return false;
+        if (node->op == GGML_OP_MUL_MAT && ggml_backend_dev_type(state->owner->device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            if (!ggml_prec_set_acc(node, GGML_PREC_F32) || !ggml_prec_set_src(node, GGML_PREC_F32, 1)) {
+                set_error("Cannot request F32 matrix inputs and accumulation");
+                return false;
+            }
         }
         if (!ggml_backend_dev_supports_op(state->owner->device, node)) {
             char message[512];
