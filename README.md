@@ -231,11 +231,74 @@ To request both search-term groups from one input:
 | `--max-tokens N` / `--max-words N` | Same aggregate token budget and explicit text-word truncation as classification. No silent truncation. |
 | `--debug` | Token IDs, label/word positions, candidate word ranges, all raw span/count logits and the predicted count. |
 
-Results are ordered by label, then descending confidence with source-position tie breaking. A predicted count of zero suppresses all results, matching the upstream entity gate. Only the first conditioning step is needed for entity lists, even when the gate predicts a larger count; repeated structured records/relations are not implemented.
+Results are ordered by label, then descending confidence with source-position tie breaking. A predicted count of zero suppresses all results, matching the upstream entity gate. Only the first conditioning step is needed for entity lists, even when the gate predicts a larger count. Repeated records use the separate structure mode below.
 
 The published checkpoint permits spans of at most **8 upstream word/punctuation tokens**, not arbitrary-length summaries. Input must fit the schema-plus-text token budget (default 512, configurable up to 4096). This first version does **not** chunk long documents; exceeding the budget returns an error. `--max-words` is explicit truncation, not full-document extraction. The processor's synthetic terminal punctuation is encoded for parity but never returned as a standalone span; suffix offsets inside a URL are clipped to the original text.
 
 CPU checks compare all raw candidate logits, count logits/gate, token/marker/word positions and decoded spans against upstream on six cases, including Unicode, URLs, truncation, empty text and the Cloudflare example. Synthetic F32/F16 coverage is part of the existing integration suite. CUDA/Metal builds use the same GGML graph but require their own new span-path hardware checks; prior classification parity does not establish span parity.
+
+## Count-conditioned structured extraction
+
+Use a **fixed record schema** when the model should discover multiple groups rather than the caller supplying topic labels:
+
+```powershell
+.\build\Release\gliner-extract.exe --model .\models\decide-spans.gguf `
+  --text-file .\request.txt `
+  --structure search_requests `
+  --field terms `
+  --description "terms=Verbatim search terms for one request needing additional context" `
+  --threshold 0.3 --top-k 5 --threads 4
+```
+
+`search_requests` and `terms` are structural names used across inputs; they are not caller-invented `d1_terms`/`email_terms` groups. The model predicts a count and conditions the same field query for each record slot. Each surviving record has its own list of term spans. This enables the machinery for fine-tuning retrieval-request grouping, **not** a guarantee that the current Decide weights already do it well: on the supplied Cloudflare text this schema currently predicts one slot but returns no fields above 0.3, matching upstream.
+
+A simple repeated-record example does work with the current checkpoint:
+
+```powershell
+.\build\Release\gliner-extract.exe --model .\models\decide-spans.gguf `
+  --text "Alice works at Contoso. Bob works at Fabrikam." `
+  --structure employment `
+  --single-field person --description "person=Employee name" `
+  --single-field company --description "company=Company where the employee works" `
+  --threads 4
+```
+
+It predicts two records and pairs `Alice` with `Contoso`, and `Bob` with `Fabrikam`. Output contains `structure`, `predicted_count` and an ordered `records` array:
+
+```json
+{
+  "structure": "employment",
+  "predicted_count": 2,
+  "records": [
+    {
+      "slot_index": 0,
+      "fields": {
+        "person": {"text": "Alice", "start": 0, "end": 5, "logit": 4.06787, "probability": 0.983174},
+        "company": {"text": "Contoso", "start": 15, "end": 22, "logit": 1.70461, "probability": 0.846136}
+      }
+    },
+    {
+      "slot_index": 1,
+      "fields": {
+        "person": {"text": "Bob", "start": 24, "end": 27, "logit": 6.84442, "probability": 0.998936},
+        "company": {"text": "Fabrikam", "start": 37, "end": 45, "logit": 3.76469, "probability": 0.977350}
+      }
+    }
+  ],
+  "offset_unit": "utf8_bytes",
+  "max_span_width": 8
+}
+```
+
+Values shown are rounded. `--field NAME` is list-valued and returns an array; `--single-field NAME` returns the highest-confidence surviving span or `null`. Descriptions use `--description NAME=TEXT`. All fields are included in each returned record; records whose fields are all empty are omitted, so `records` may be shorter than `predicted_count`. `slot_index` retains the original predicted slot, including gaps after filtering.
+
+The `[P]` state predicts counts **0..19**. `--max-records N` (default 19) is a safety cap, not a requested count: a larger prediction fails explicitly without truncating slots. Count zero returns no records and does not run the slot head. The runtime encodes the text once, retains word/field features on the selected device, then runs a head-only graph with the learned count-position embeddings and recurrent GRU state for the predicted number of slots. It never reloads the model or reruns the encoder per record.
+
+Thresholding, overlap suppression and `--top-k` apply within each field and slot. Single fields always keep at most one span; top-k limits list fields. Fields and slots are decoded independently: spans may repeat across fields/records and no cross-record deduplication, uniqueness or relational constraints are imposed. The count limit, eight-token span width, UTF-8 byte offsets and aggregate text-token budget still apply; no new model format or reconversion is needed beyond a span-capable GGUF.
+
+This first version supports one structure with ordered list/single extractive fields per call. It does not support nested records, enumerated-choice fields, field validators, mixed classification/entity/structure schemas or automatic long-document chunking. The structure name `entities` is reserved for the entity path. `--debug` exposes count logits and raw `[predicted_count, field_count, candidate_count]` record logits, plus field/word positions and candidate ranges, for parity checks and future fine-tuning evaluation.
+
+CPU reference checks cover real repeated-record examples and all slot logits. Synthetic F32/F16 cases exercise predicted counts 0, 1, 2, 3 and 19, recurrence, Unicode offsets, list/single decoding, empty-record filtering and safety-cap errors. CUDA/Metal hardware checks of the structured path remain pending.
 
 ## Performance benchmark
 
@@ -394,6 +457,34 @@ if (status == GLINER_STATUS_OK) {
 
 `gliner_model_supports_spans` reports capability. Input pointers are borrowed for the call. Returned strings, arrays and `gliner_get_span_scores` diagnostic pointers are state-owned and valid until its next inference call or destruction. Offsets count UTF-8 bytes, not Unicode code points or UTF-16 code units. An empty match set is successful, not a fabricated fallback. Any failure clears results; switching between extraction and classification also clears the previous operation's results. Each state remains single-threaded; multiple states share immutable encoder and head weights.
 
+### Repeated record API
+
+Given the same span-capable `ctx` and an initialized `state`:
+
+```c
+const struct gliner_record_field fields[] = {
+    {"terms", "Verbatim search terms for one request needing additional context", GLINER_FIELD_LIST}
+};
+struct gliner_record_params options = gliner_default_record_params();
+options.n_threads = 4;
+options.max_spans_per_field = 5;
+int status = gliner_extract_records(ctx, state, text, "search_requests", fields, 1, &options);
+if (status == GLINER_STATUS_OK) {
+    const struct gliner_record * records = gliner_get_records(state);
+    const struct gliner_span * spans = gliner_get_record_spans(state);
+    for (int r = 0; r < gliner_n_records(state); ++r) {
+        for (int i = records[r].span_offset; i < records[r].span_offset + records[r].n_spans; ++i) {
+            printf("slot %d / %s: %s\n", records[r].slot_index,
+                   fields[spans[i].label_index].name, spans[i].text);
+        }
+    }
+} else {
+    fprintf(stderr, "%s\n", gliner_last_error());
+}
+```
+
+`gliner_record` indexes the flat `gliner_get_record_spans` array; each span's `label_index` is its field index. Missing list/single fields have no span entries. `gliner_get_record_scores` provides raw slot logits and the predicted count, including count zero or all-empty decoded records. All results are state-owned until the next inference/free, and a failure clears them. Entity, record and classification result getters remain distinct and are cleared when switching operations.
+
 ### Initialize from a byte buffer
 
 ```c
@@ -434,8 +525,8 @@ Loading uses GGML's GGUF callback parser and at most 8 MiB tensor-transfer chunk
 
 ## Scope and remaining work
 
-Supported: one text with jointly encoded classification tasks or grouped verbatim span labels per call; task/label descriptions; classification decoding and thresholded, overlap-resolved entity spans with the published Decide configuration.
+Supported: one text with jointly encoded classification tasks, grouped verbatim span labels, or one count-conditioned repeated-record schema per call; descriptions; list/single extractive fields; classification decoding and thresholded, overlap-resolved spans with the published Decide configuration.
 
-Not implemented: structured JSON/record/relation extraction, generated search queries, mixed classification/extraction in the same call, few-shot examples, constrained/beam/exact decision decoding, calibration fitting, automatic long-document chunking, alternate encoders/tokenizer pipelines, multi-document padded batching, quantization, memory-mapped weights, hybrid CPU/GPU offload or multi-GPU execution. Span GPU validation and broader hardware coverage remain pending. See [NEXT_STEPS.md](NEXT_STEPS.md).
+Not implemented: nested/choice-field/relation extraction, generated search queries, mixed classification/extraction or multiple structures in the same call, few-shot examples, constrained/beam/exact decision decoding, calibration fitting, automatic long-document chunking, alternate encoders/tokenizer pipelines, multi-document padded batching, quantization, memory-mapped weights, hybrid CPU/GPU offload or multi-GPU execution. Span/record GPU validation and broader hardware coverage remain pending. See [NEXT_STEPS.md](NEXT_STEPS.md).
 
 The model checkpoint is [Apache 2.0 licensed](https://huggingface.co/fastino/GLiNER2.5-Decide); review its license when redistributing converted weights. Checkpoints and generated GGUF files stay out of Git.

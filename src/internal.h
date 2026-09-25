@@ -76,11 +76,13 @@ struct ClassificationTask {
     std::vector<std::optional<std::string>> descriptions;
 };
 
+enum class SchemaKind { Classification, Entities, Records };
+
 class Tokenizer {
 public:
     explicit Tokenizer(const GgufFile & file);
     Tokenized encode(const std::string & text, const std::vector<ClassificationTask> & tasks,
-                     int max_words, int max_tokens, bool entities = false) const;
+                     int max_words, int max_tokens, SchemaKind kind = SchemaKind::Classification) const;
 private:
     struct Node {
         std::unordered_map<unsigned char, size_t> children;
@@ -107,6 +109,9 @@ public:
     ggml_tensor * build(ggml_context * ctx, ggml_tensor * encoded, ggml_tensor * words,
                        ggml_tensor * labels, ggml_tensor * prompt, ggml_tensor * starts,
                        ggml_tensor * ends, ggml_tensor * count_index, ggml_tensor *& count_logits) const;
+    ggml_tensor * count(ggml_context * ctx, ggml_tensor * prompt_states) const;
+    ggml_tensor * score(ggml_context * ctx, ggml_tensor * word_states, ggml_tensor * queries,
+                       ggml_tensor * starts, ggml_tensor * ends, ggml_tensor * count_indices) const;
     int hidden;
     int max_width;
 private:

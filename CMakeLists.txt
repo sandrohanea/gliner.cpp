@@ -212,6 +212,12 @@ if(BUILD_TESTING)
                     --binary "$<TARGET_FILE:gliner-extract>" --spans-only --expect-backend "${GLINER_COMPILED_BACKEND}")
             set_tests_properties(gliner-real-span-parity PROPERTIES LABELS "parity;spans;${GLINER_COMPILED_BACKEND}" TIMEOUT 600)
             list(APPEND GLINER_PARITY_TESTS gliner-real-span-parity)
+            add_test(NAME gliner-real-record-parity
+                COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_parity.py"
+                    --checkpoint "${GLINER_PARITY_CHECKPOINT}" --gguf "${GLINER_SPAN_PARITY_GGUF}"
+                    --binary "$<TARGET_FILE:gliner-extract>" --records-only --expect-backend "${GLINER_COMPILED_BACKEND}")
+            set_tests_properties(gliner-real-record-parity PROPERTIES LABELS "parity;records;${GLINER_COMPILED_BACKEND}" TIMEOUT 600)
+            list(APPEND GLINER_PARITY_TESTS gliner-real-record-parity)
         endif()
     endif()
     if(GLINER_COMPILED_BACKEND STREQUAL "cuda")

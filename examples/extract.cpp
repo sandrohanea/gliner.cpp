@@ -12,17 +12,27 @@ void usage() {
     std::cout <<
         "Usage: gliner-extract --model model.gguf --text \"text\" --labels product,person\n"
         "       gliner-extract --model model.gguf --text-file input.txt --label \"D1 search term\" --description \"D1 search term=Terms about D1 limits\"\n"
+        "       gliner-extract --model model.gguf --text-file input.txt --structure search_requests --field terms\n"
         "Options:\n"
         "  --labels a,b | --label NAME  Extraction labels/groups; --label may repeat\n"
         "  --description NAME=TEXT      Optional label description; may repeat\n"
+        "  --structure NAME            Extract repeated records instead of entity groups\n"
+        "  --field NAME                List-valued field; repeat for additional fields\n"
+        "  --single-field NAME         Field containing only its best surviving span\n"
+        "  --max-records N             Safety limit 1..19 (default 19); excess is an error\n"
         "  --threshold P               Inclusive probability cutoff (default 0.5)\n"
-        "  --top-k N                   Maximum spans per label after suppression (0 = all)\n"
+        "  --top-k N                   Maximum spans per label/list field after suppression (0 = all)\n"
         "  --allow-overlap             Keep overlapping spans within a label\n"
         "  --threads N                 CPU threads (default 1)\n"
         "  --max-tokens N              Schema + text limit, 1..4096 (default 512)\n"
         "  --max-words N               Explicit word truncation (0 = none)\n"
         "  --debug                     Include tokens, word/label positions, count and raw span logits\n"
         "Returns verbatim UTF-8 spans and byte offsets. No generated terms or automatic long-text chunking.\n";
+}
+
+void write_span(std::ostream & out, const gliner_span & span) {
+    out << "{\"text\":\"" << escape_json(span.text) << "\",\"start\":" << span.start << ",\"end\":" << span.end
+        << ",\"logit\":" << span.logit << ",\"probability\":" << span.probability << '}';
 }
 }
 
@@ -35,6 +45,9 @@ int gliner_cli_main(const std::vector<std::string> & args) {
         }
         std::string model_path, text, text_file;
         bool has_text = false, has_file = false, debug = false;
+        bool has_labels = false, has_structure = false, has_record_limit = false;
+        int max_records = 19;
+        std::vector<gliner_field_type> field_types;
         auto params = gliner_default_span_params();
         TaskOptions schema;
         schema.name = "entities";
@@ -48,8 +61,16 @@ int gliner_cli_main(const std::vector<std::string> & args) {
             if (arg == "--model") model_path = value;
             else if (arg == "--text") { text = value; has_text = true; }
             else if (arg == "--text-file") { text_file = value; has_file = true; }
-            else if (arg == "--labels") { schema.labels = split_labels(value); schema.comma_labels = true; }
-            else if (arg == "--label") { schema.labels.push_back(value); schema.repeated_labels = true; }
+            else if (arg == "--labels") { schema.labels = split_labels(value); schema.comma_labels = true; has_labels = true; }
+            else if (arg == "--label") { schema.labels.push_back(value); schema.repeated_labels = true; has_labels = true; }
+            else if (arg == "--structure") {
+                if (has_structure || value.empty() || value == "entities") throw std::invalid_argument("Provide one nonempty --structure name, other than 'entities'");
+                schema.name = value;
+                has_structure = true;
+            } else if (arg == "--field" || arg == "--single-field") {
+                schema.labels.push_back(value);
+                field_types.push_back(arg == "--field" ? GLINER_FIELD_LIST : GLINER_FIELD_SINGLE);
+            } else if (arg == "--max-records") { max_records = integer(value); has_record_limit = true; }
             else if (arg == "--description") schema.description_args.push_back(value);
             else if (arg == "--threads") params.n_threads = integer(value);
             else if (arg == "--max-tokens") params.max_tokens = integer(value);
@@ -65,6 +86,10 @@ int gliner_cli_main(const std::vector<std::string> & args) {
         if (params.n_threads <= 0 || params.max_tokens <= 0 || params.max_tokens > 4096) {
             throw std::invalid_argument("Threads must be positive and max_tokens must be 1..4096");
         }
+        if ((has_structure && (has_labels || field_types.empty())) ||
+            (!has_structure && (!field_types.empty() || has_record_limit)) || max_records < 1 || max_records > 19) {
+            throw std::invalid_argument("Use --structure with fields and max-records 1..19, or entity labels; do not mix the modes");
+        }
         schema.validate(true);
         if (schema.labels.size() > static_cast<size_t>(params.max_tokens)) throw std::invalid_argument("Labels must fit max_tokens");
         if (has_file) text = read_text_file(text_file);
@@ -77,8 +102,68 @@ int gliner_cli_main(const std::vector<std::string> & args) {
         if (!model) throw std::runtime_error(gliner_last_error());
         std::unique_ptr<gliner_state, decltype(&gliner_free_state)> state(gliner_init_state(model.get()), gliner_free_state);
         if (!state) throw std::runtime_error(gliner_last_error());
-        if (gliner_extract_spans(model.get(), state.get(), text.c_str(), labels.data(), static_cast<int>(labels.size()), &params) != GLINER_STATUS_OK) {
+        int status;
+        if (has_structure) {
+            std::vector<gliner_record_field> fields;
+            for (size_t i = 0; i < labels.size(); ++i) fields.push_back({labels[i].name, labels[i].description, field_types[i]});
+            const gliner_record_params record_params = {params.n_threads, params.max_tokens, params.max_words,
+                params.threshold, max_records, params.max_spans_per_label, params.allow_overlap};
+            status = gliner_extract_records(model.get(), state.get(), text.c_str(), schema.name.c_str(),
+                                           fields.data(), static_cast<int>(fields.size()), &record_params);
+        } else {
+            status = gliner_extract_spans(model.get(), state.get(), text.c_str(), labels.data(), static_cast<int>(labels.size()), &params);
+        }
+        if (status != GLINER_STATUS_OK) {
             throw std::runtime_error(gliner_last_error());
+        }
+        if (has_structure) {
+            const auto * records = gliner_get_records(state.get());
+            const auto * spans = gliner_get_record_spans(state.get());
+            const auto * raw = gliner_get_record_scores(state.get());
+            std::ostringstream output;
+            output.imbue(std::locale::classic());
+            output << std::setprecision(9) << "{\"structure\":\"" << escape_json(schema.name)
+                   << "\",\"predicted_count\":" << raw->predicted_count << ",\"records\":[";
+            for (int r = 0; r < gliner_n_records(state.get()); ++r) {
+                if (r) output << ',';
+                output << "{\"slot_index\":" << records[r].slot_index << ",\"fields\":{";
+                for (size_t f = 0; f < labels.size(); ++f) {
+                    if (f) output << ',';
+                    output << '"' << escape_json(schema.labels[f]) << "\":";
+                    const bool list = field_types[f] == GLINER_FIELD_LIST;
+                    if (list) output << '[';
+                    bool first = true;
+                    for (int i = records[r].span_offset; i < records[r].span_offset + records[r].n_spans; ++i) {
+                        if (spans[i].label_index != static_cast<int>(f)) continue;
+                        if (!first) output << ',';
+                        write_span(output, spans[i]);
+                        first = false;
+                    }
+                    if (list) output << ']';
+                    else if (first) output << "null";
+                }
+                output << "}}";
+            }
+            output << "],\"offset_unit\":\"utf8_bytes\",\"max_span_width\":" << raw->max_width;
+            if (debug) {
+                output << ",\"backend\":\"" << gliner_model_backend_name(model.get()) << "\",\"input_ids\":";
+                array(output, gliner_get_token_ids(state.get()), static_cast<size_t>(gliner_n_tokens(state.get())));
+                output << ",\"field_positions\":";
+                array(output, raw->field_positions, raw->n_fields);
+                output << ",\"word_positions\":";
+                array(output, raw->word_positions, raw->n_words);
+                output << ",\"start_words\":";
+                array(output, raw->start_words, raw->n_candidates);
+                output << ",\"end_words\":";
+                array(output, raw->end_words, raw->n_candidates);
+                output << ",\"record_logits\":";
+                array(output, raw->logits, static_cast<size_t>(raw->predicted_count) * raw->n_fields * raw->n_candidates);
+                output << ",\"count_logits\":";
+                array(output, raw->count_logits, 20);
+            }
+            output << "}\n";
+            std::cout << output.str();
+            return 0;
         }
         const auto * spans = gliner_get_spans(state.get());
         const auto * raw = gliner_get_span_scores(state.get());
@@ -93,8 +178,7 @@ int gliner_cli_main(const std::vector<std::string> & args) {
                 const auto & span = spans[i];
                 if (span.label_index != static_cast<int>(label)) continue;
                 if (!first) output << ',';
-                output << "{\"text\":\"" << escape_json(span.text) << "\",\"start\":" << span.start << ",\"end\":" << span.end
-                       << ",\"logit\":" << span.logit << ",\"probability\":" << span.probability << '}';
+                write_span(output, span);
                 first = false;
             }
             output << "]}";

@@ -116,6 +116,101 @@ static int test_spans(const char * path) {
     return 0;
 }
 
+static int test_records(const char * path, int expected_count) {
+    struct gliner_context * ctx = gliner_init_from_file(path);
+    CHECK(ctx != NULL && gliner_model_supports_spans(ctx));
+    struct gliner_state * state = gliner_init_state(ctx);
+    CHECK(state != NULL);
+    const struct gliner_record_field fields[] = {
+        {"terms", "Relevant phrases", GLINER_FIELD_LIST},
+        {"subject", NULL, GLINER_FIELD_SINGLE}
+    };
+    const char * text = "Caf\xc3\xa9 Alice works at Contoso. Bob works elsewhere.";
+    struct gliner_record_params params = gliner_default_record_params();
+    CHECK(params.max_records == 19);
+    params.threshold = 0;
+    params.max_spans_per_field = 2;
+    params.allow_overlap = 1;
+    int calls = 0;
+    gliner_set_eval_callback(state, span_layer, &calls);
+    CHECK(gliner_extract_records(ctx, state, text, "requests", fields, 2, &params) == GLINER_STATUS_OK);
+    CHECK(calls == gliner_model_n_layers(ctx) + 1);
+    gliner_set_eval_callback(state, NULL, NULL);
+    CHECK(gliner_n_records(state) == expected_count);
+    CHECK(gliner_n_spans(state) == 0 && gliner_get_span_scores(state) == NULL);
+    CHECK(gliner_n_scores(state) == 0 && gliner_n_tasks(state) == 0);
+    const struct gliner_record_scores * raw = gliner_get_record_scores(state);
+    CHECK(raw != NULL && raw->predicted_count == expected_count && raw->n_fields == 2);
+    CHECK(raw->n_candidates > 0 && raw->n_words > 0 && raw->count_logits != NULL);
+    CHECK(raw->field_positions[0] < raw->field_positions[1]);
+    const struct gliner_record * records = gliner_get_records(state);
+    const struct gliner_span * spans = gliner_get_record_spans(state);
+    if (expected_count == 0) {
+        CHECK(records == NULL && spans == NULL && raw->logits == NULL);
+    } else {
+        CHECK(records != NULL && spans != NULL && raw->logits != NULL);
+        for (int r = 0; r < expected_count; ++r) {
+            CHECK(records[r].slot_index == r && records[r].n_spans == 3);
+            CHECK(records[r].span_offset == r * 3);
+            for (int i = 0; i < 3; ++i) {
+                const struct gliner_span * span = &spans[records[r].span_offset + i];
+                CHECK(span->label_index == (i < 2 ? 0 : 1));
+                CHECK(span->start < span->end && span->end <= strlen(text));
+                CHECK(strlen(span->text) == span->end - span->start);
+                CHECK(memcmp(span->text, text + span->start, span->end - span->start) == 0);
+            }
+        }
+        if (expected_count > 1) {
+            CHECK(fabsf(raw->logits[0] - raw->logits[2 * raw->n_candidates]) > 1e-7f);
+        }
+    }
+    for (int i = 0; i < 3; ++i) {
+        CHECK(gliner_extract_records(ctx, state, text, "requests", fields, 2, &params) == GLINER_STATUS_OK);
+        CHECK(gliner_n_records(state) == expected_count);
+    }
+    params.threshold = 1;
+    CHECK(gliner_extract_records(ctx, state, text, "requests", fields, 2, &params) == GLINER_STATUS_OK);
+    CHECK(gliner_n_records(state) == 0 && gliner_get_records(state) == NULL);
+    CHECK(gliner_get_record_scores(state)->predicted_count == expected_count);
+    params.threshold = 0;
+    CHECK(gliner_extract_records(ctx, state, "", "requests", fields, 2, &params) == GLINER_STATUS_OK);
+    CHECK(gliner_n_records(state) == 0);
+    if (expected_count > 1) {
+        params.max_records = expected_count - 1;
+        CHECK(gliner_extract_records(ctx, state, text, "requests", fields, 2, &params) == GLINER_STATUS_INVALID_ARGUMENT);
+        CHECK(strstr(gliner_last_error(), "exceeds max_records") != NULL);
+        CHECK(gliner_get_record_scores(state) == NULL && gliner_n_tokens(state) == 0);
+    }
+    params.max_records = 19;
+    const struct gliner_record_field bad_type[] = {{"a", NULL, (enum gliner_field_type)99}};
+    CHECK(gliner_extract_records(ctx, state, text, "requests", bad_type, 1, &params) == GLINER_STATUS_INVALID_ARGUMENT);
+    CHECK(gliner_extract_records(ctx, state, text, "requests", NULL, 1, &params) == GLINER_STATUS_INVALID_ARGUMENT);
+    CHECK(gliner_extract_records(ctx, state, text, NULL, fields, 2, &params) == GLINER_STATUS_INVALID_ARGUMENT);
+    CHECK(gliner_extract_records(ctx, state, text, "entities", fields, 2, &params) == GLINER_STATUS_INVALID_ARGUMENT);
+    CHECK(gliner_extract_records(ctx, state, text, "requests", fields, INT_MAX, &params) == GLINER_STATUS_INVALID_ARGUMENT);
+    CHECK(gliner_extract_records(ctx, state, "\xff", "requests", fields, 2, &params) == GLINER_STATUS_INVALID_ARGUMENT);
+    params.max_records = 0;
+    CHECK(gliner_extract_records(ctx, state, text, "requests", fields, 2, &params) == GLINER_STATUS_INVALID_ARGUMENT);
+    params.max_records = 20;
+    CHECK(gliner_extract_records(ctx, state, text, "requests", fields, 2, &params) == GLINER_STATUS_INVALID_ARGUMENT);
+    params.max_records = 19;
+    params.max_tokens = 2;
+    CHECK(gliner_extract_records(ctx, state, text, "requests", fields, 2, &params) == GLINER_STATUS_INVALID_ARGUMENT);
+    params.max_tokens = 512;
+    CHECK(gliner_extract_records(ctx, state, text, "requests", fields, 2, &params) == GLINER_STATUS_OK);
+    const struct gliner_span_label label = {"term", NULL};
+    CHECK(gliner_extract_spans(ctx, state, text, &label, 1, NULL) == GLINER_STATUS_OK);
+    CHECK(gliner_n_records(state) == 0 && gliner_get_record_scores(state) == NULL);
+    CHECK(gliner_extract_records(ctx, state, text, "requests", fields, 2, &params) == GLINER_STATUS_OK);
+    const char * classes[] = {"yes", "no"};
+    CHECK(gliner_classify_text(ctx, state, text, "intent", classes, 2, NULL) == GLINER_STATUS_OK);
+    CHECK(gliner_n_records(state) == 0 && gliner_get_record_spans(state) == NULL);
+    CHECK(gliner_get_record_scores(state) == NULL);
+    gliner_free_state(state);
+    gliner_free(ctx);
+    return 0;
+}
+
 struct eval_count {
     int layers;
     int tokens;
@@ -329,6 +424,7 @@ static int test_loading(const char * path, struct gliner_context * reference) {
 }
 
 int main(int argc, char ** argv) {
+    if (argc == 4 && strcmp(argv[1], "--records") == 0) return test_records(argv[2], atoi(argv[3]));
     if (argc == 3 && strcmp(argv[1], "--spans") == 0) return test_spans(argv[2]);
     CHECK(gliner_model_hidden_size(NULL) == 0);
     CHECK(gliner_model_n_tensors(NULL) == 0);
@@ -338,6 +434,10 @@ int main(int argc, char ** argv) {
     CHECK(gliner_n_spans(NULL) == 0);
     CHECK(gliner_get_spans(NULL) == NULL);
     CHECK(gliner_get_span_scores(NULL) == NULL);
+    CHECK(gliner_n_records(NULL) == 0);
+    CHECK(gliner_get_records(NULL) == NULL);
+    CHECK(gliner_get_record_spans(NULL) == NULL);
+    CHECK(gliner_get_record_scores(NULL) == NULL);
     CHECK(gliner_model_backend_name(NULL) == NULL);
     CHECK(gliner_model_device_name(NULL) == NULL);
     CHECK(gliner_n_scores(NULL) == 0);

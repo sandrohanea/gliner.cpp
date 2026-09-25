@@ -80,6 +80,28 @@ SPAN_CASES = [
                       "Words or short phrases needed to search official documentation for the Cloudflare Email Sending combined recipient limit. Include the product name and the property whose limit is requested."]},
 ]
 
+RECORD_CASES = [
+    {"text": "Alice works at Contoso. Bob works at Fabrikam.", "structure": "employment",
+     "fields": [{"name": "person", "type": "single", "description": "Employee name"},
+                {"name": "company", "type": "single", "description": "Company where the employee works"}],
+     "threshold": 0., "synthetic_count": 2},
+    {"text": SPAN_CASES[-1]["text"], "structure": "search_requests",
+     "fields": [{"name": "terms", "type": "list", "description": "Verbatim search terms for one request needing additional context"}],
+     "threshold": 0.3, "top_k": 5, "synthetic_count": 3},
+    {"text": "Caf\u00e9 \u0130 \u4e2d\u6587. \U0001f680 Other words.", "structure": "items",
+     "fields": [{"name": "name", "type": "single", "description": ""},
+                {"name": "terms", "type": "list", "description": "Relevant [C] phrases"}],
+     "threshold": 0., "top_k": 2, "synthetic_count": 2},
+    {"text": "", "structure": "requests", "fields": [{"name": "terms", "type": "list"}],
+     "threshold": 0., "synthetic_count": 0},
+    {"text": "hello world", "structure": "items", "fields": [{"name": "name", "type": "single"}],
+     "threshold": 0., "synthetic_count": 19},
+    {"text": "Alpha Beta Gamma ignored", "structure": "items", "fields": [{"name": "terms", "type": "list"}],
+     "max_words": 2, "allow_overlap": True, "threshold": 0., "top_k": 2, "synthetic_count": 1},
+    {"text": "nothing selected", "structure": "items", "fields": [{"name": "terms", "type": "list"}],
+     "threshold": 1., "synthetic_count": 3},
+]
+
 
 def load_oracle(checkpoint):
     config = DebertaV2Config.from_pretrained(checkpoint / "encoder_config")
@@ -138,12 +160,8 @@ def load_span_oracle(checkpoint):
     return processor, encoder, span, count_embed, count_pred, width
 
 
-def span_reference(oracle, case):
-    from gliner2.inference.candidate_decoder import finalize_spans
+def span_forward(oracle, case, schema):
     processor, encoder, span, count_embed, count_pred, width = oracle
-    labels = case["labels"]
-    descs = {label: desc for label, desc in zip(labels, case.get("descriptions", []))}
-    schema = {"entities": {label: [] for label in labels}, "entity_descriptions": descs}
     batch = processor.collate_fn_inference([(case["text"], schema)], max_len=case.get("max_words"), error_policy="raise")
     with torch.inference_mode():
         encoded = encoder(input_ids=batch.input_ids, attention_mask=batch.attention_mask).last_hidden_state
@@ -162,8 +180,19 @@ def span_reference(oracle, case):
         valid_spans = torch.stack([all_spans[s, e - s - 1] for s, e in zip(starts, ends)])
         queries = torch.stack(groups[0][0])
         count_logits = count_pred(queries[:1])[0]
+    return batch, starts, ends, valid_spans, queries, count_logits
+
+
+def span_reference(oracle, case):
+    from gliner2.inference.candidate_decoder import finalize_spans
+    labels = case["labels"]
+    descs = {label: desc for label, desc in zip(labels, case.get("descriptions", []))}
+    schema = {"entities": {label: [] for label in labels}, "entity_descriptions": descs}
+    batch, starts, ends, valid_spans, queries, count_logits = span_forward(oracle, case, schema)
+    n_words, width = len(batch.text_tokens[0]), oracle[-1]
+    with torch.inference_mode():
         predicted = int(count_logits.argmax())
-        projected = count_embed(queries[1:], 1)[0]
+        projected = oracle[3](queries[1:], 1)[0]
         logits = torch.einsum("sh,qh->qs", valid_spans, projected)
         probs = logits.sigmoid()
     results = []
@@ -194,6 +223,46 @@ def span_reference(oracle, case):
             "span_logits": logits.flatten().tolist(), "count_logits": count_logits.tolist(),
             "predicted_count": predicted, "max_span_width": width, "groups": results}
 
+def record_reference(oracle, case):
+    from gliner2.inference.candidate_decoder import finalize_spans
+    fields = case["fields"]
+    name = case["structure"]
+    schema = {"json_structures": [{name: {field["name"]: [] for field in fields}}],
+              "json_descriptions": {name: {field["name"]: field["description"] for field in fields if "description" in field}}}
+    batch, starts, ends, spans, queries, count_logits = span_forward(oracle, case, schema)
+    predicted = int(count_logits.argmax())
+    with torch.inference_mode():
+        projected = oracle[3](queries[1:], predicted) if predicted else None
+        logits = torch.einsum("sh,rfh->rfs", spans, projected) if predicted else torch.empty((0, len(fields), len(starts)))
+        probabilities = logits.sigmoid()
+    text, records = case["text"], []
+    for slot in range(predicted):
+        record = {}
+        for f, field in enumerate(fields):
+            candidates, by_offset = [], {}
+            for i, (s, e) in enumerate(zip(starts, ends)):
+                first, last = batch.start_mappings[0][s], batch.start_mappings[0][e - 1]
+                end = min(len(text), batch.end_mappings[0][e - 1])
+                if first >= len(text) or last >= len(text) or probabilities[slot, f, i] < case.get("threshold", 0.5):
+                    continue
+                start_byte, end_byte = len(text[:first].encode("utf8")), len(text[:end].encode("utf8"))
+                candidates.append((text[first:end], float(probabilities[slot, f, i]), start_byte, end_byte))
+                by_offset[start_byte, end_byte] = float(logits[slot, f, i])
+            selected = finalize_spans(candidates, dtype="str" if field["type"] == "single" else "list",
+                                      suppress=not case.get("allow_overlap", False))
+            if field["type"] == "list" and case.get("top_k", 0):
+                selected = selected[:case["top_k"]]
+            values = [{"text": surface, "probability": probability, "start": start, "end": end,
+                       "logit": by_offset[start, end]} for surface, probability, start, end in selected]
+            record[field["name"]] = values if field["type"] == "list" else values[0] if values else None
+        if any(value is not None and value != [] for value in record.values()):
+            records.append({"slot_index": slot, "fields": record})
+    return {"case": case, "structure": name, "records": records, "predicted_count": predicted,
+            "input_ids": batch.input_ids[0].tolist(), "field_positions": batch.schema_special_indices[0][0][1:],
+            "word_positions": batch.text_word_indices[0, :len(batch.text_tokens[0])].tolist(),
+            "start_words": starts, "end_words": ends, "count_logits": count_logits.tolist(),
+            "record_logits": logits.flatten().tolist(), "max_span_width": oracle[-1]}
+
 
 def compare_spans(binary, model, expected, tolerance, backend):
     case = expected["case"]
@@ -223,6 +292,40 @@ def compare_spans(binary, model, expected, tolerance, backend):
                                        atol=tolerance, rtol=tolerance)
     error = max(abs(a - b) for a, b in zip(actual["span_logits"], expected["span_logits"]))
     print(f"PASS spans {backend}: {len(actual['input_ids'])} tokens; {len(expected['span_logits'])} raw logits; max error {error:.8g}")
+
+def compare_records(binary, model, expected, tolerance, backend):
+    case = expected["case"]
+    args = [str(binary), "--model", str(model), "--text", case["text"], "--structure", case["structure"],
+            "--threads", "4", "--max-tokens", "2048", "--debug"]
+    for field in case["fields"]:
+        args += ["--single-field" if field["type"] == "single" else "--field", field["name"]]
+        if "description" in field:
+            args += ["--description", field["name"] + "=" + field["description"]]
+    for name, option in (("threshold", "--threshold"), ("top_k", "--top-k"), ("max_words", "--max-words")):
+        if name in case:
+            args += [option, str(case[name])]
+    if case.get("allow_overlap"):
+        args += ["--allow-overlap"]
+    actual = json.loads(subprocess.check_output(args, encoding="utf8"))
+    assert actual["backend"] == backend and actual["offset_unit"] == "utf8_bytes"
+    for key in ("structure", "input_ids", "field_positions", "word_positions", "start_words", "end_words", "predicted_count", "max_span_width"):
+        assert actual[key] == expected[key], key
+    for key in ("count_logits", "record_logits"):
+        np.testing.assert_allclose(actual[key], expected[key], atol=tolerance, rtol=tolerance, err_msg=key)
+    assert len(actual["records"]) == len(expected["records"]), (actual["records"], expected["records"])
+    for record, ref in zip(actual["records"], expected["records"]):
+        assert record["slot_index"] == ref["slot_index"]
+        for field in case["fields"]:
+            value, reference = record["fields"][field["name"]], ref["fields"][field["name"]]
+            if field["type"] == "single":
+                value, reference = ([] if value is None else [value]), ([] if reference is None else [reference])
+            assert [(v["text"], v["start"], v["end"]) for v in value] == [(v["text"], v["start"], v["end"]) for v in reference]
+            for v, r in zip(value, reference):
+                np.testing.assert_allclose([v["logit"], v["probability"]], [r["logit"], r["probability"]],
+                                           atol=tolerance, rtol=tolerance)
+    error = max((abs(a - b) for a, b in zip(actual["record_logits"], expected["record_logits"])), default=0)
+    print(f"PASS records {backend}: {len(actual['input_ids'])} tokens; {actual['predicted_count']} slots; "
+          f"{len(actual['records'])} nonempty records; max logit error {error:.8g}")
 
 
 def reference(oracle, case):
@@ -344,6 +447,7 @@ def main():
     group.add_argument("--single-only", action="store_true", help="Run/write only single-task cases")
     group.add_argument("--kernel-only", action="store_true", help="Generate/test short and long sequences with a 32-wide synthetic encoder")
     group.add_argument("--spans-only", action="store_true", help="Generate/test grouped entity span extraction using gliner-extract")
+    group.add_argument("--records-only", action="store_true", help="Generate/test count-conditioned records using gliner-extract")
     parser.add_argument("--case", type=int, action="append")
     parser.add_argument("--tolerance", type=float, default=3e-4)
     args = parser.parse_args()
@@ -365,16 +469,23 @@ def main():
         if checkpoint is None:
             checkpoint = directory
             create_checkpoint(checkpoint, hidden=32 if args.kernel_only else 8, layers=2,
-                              compact_tokens=args.kernel_only, spans=args.spans_only)
-        oracle = load_span_oracle(checkpoint) if args.spans_only else load_oracle(checkpoint)
-        cases = SPAN_CASES if args.spans_only else KERNEL_CASES if args.kernel_only else BATCH_CASES if args.batch_only else CASES if args.single_only else CASES + BATCH_CASES
+                              compact_tokens=args.kernel_only, spans=args.spans_only or args.records_only,
+                              records=args.records_only)
+        oracle = load_span_oracle(checkpoint) if args.spans_only or args.records_only else load_oracle(checkpoint)
+        cases = RECORD_CASES if args.records_only else SPAN_CASES if args.spans_only else KERNEL_CASES if args.kernel_only else BATCH_CASES if args.batch_only else CASES if args.single_only else CASES + BATCH_CASES
         selected = cases if args.case is None else [cases[i] for i in args.case]
         fixtures = []
         for case in selected:
-            expected = span_reference(oracle, case) if args.spans_only else reference(oracle, case)
+            if args.records_only and args.checkpoint is None:
+                with torch.no_grad():
+                    oracle[4][2].bias.zero_()
+                    oracle[4][2].bias[case["synthetic_count"]] = 1.
+            expected = record_reference(oracle, case) if args.records_only else span_reference(oracle, case) if args.spans_only else reference(oracle, case)
             fixtures.append(expected)
             if args.binary and args.gguf:
-                if args.spans_only:
+                if args.records_only:
+                    compare_records(args.binary, args.gguf, expected, args.tolerance, backend)
+                elif args.spans_only:
                     compare_spans(args.binary, args.gguf, expected, args.tolerance, backend)
                 else:
                     compare(args.binary, args.gguf, expected, args.tolerance, directory, backend)
@@ -387,7 +498,8 @@ def main():
                                "generator": "tests/test_parity.py " + ("--batch-only " if args.batch_only else
                                                                       "--single-only " if args.single_only else
                                                                       "--kernel-only " if args.kernel_only else
-                                                                      "--spans-only " if args.spans_only else "") + "--write-golden"},
+                                                                      "--spans-only " if args.spans_only else
+                                                                      "--records-only " if args.records_only else "") + "--write-golden"},
                 "fixtures": fixtures}, separators=(",", ":")), encoding="utf8")
 
 

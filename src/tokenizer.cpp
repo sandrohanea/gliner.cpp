@@ -293,10 +293,11 @@ void Tokenizer::segment(const std::string & text, std::vector<int32_t> & ids) co
 }
 
 Tokenized Tokenizer::encode(const std::string & text, const std::vector<ClassificationTask> & tasks,
-                           int max_words, int max_tokens, bool entities) const {
+                           int max_words, int max_tokens, SchemaKind kind) const {
     if (tasks.empty()) throw std::invalid_argument("Classification tasks are required");
-    if (entities && std::find(added_.begin(), added_.end(), "[E]") == added_.end()) {
-        throw std::runtime_error("Missing [E] token required for span extraction");
+    const char * marker = kind == SchemaKind::Entities ? "[E]" : kind == SchemaKind::Records ? "[C]" : "[L]";
+    if (std::find(added_.begin(), added_.end(), marker) == added_.end()) {
+        throw std::runtime_error(std::string("Missing schema marker: ") + marker);
     }
     if (tasks.size() > 1 && std::find(added_.begin(), added_.end(), "[SEP_STRUCT]") == added_.end()) {
         throw std::runtime_error("Missing [SEP_STRUCT] token required for joint classification");
@@ -336,7 +337,7 @@ Tokenized Tokenizer::encode(const std::string & text, const std::vector<Classifi
         emit("[P]"); emit(prompt_text); emit("(");
         for (const auto & label : task.labels) {
             result.markers.push_back(static_cast<int32_t>(result.ids.size()));
-            emit(entities ? "[E]" : "[L]");
+            emit(marker);
             emit(label);
         }
         emit(")"); emit(")");
@@ -345,7 +346,7 @@ Tokenized Tokenizer::encode(const std::string & text, const std::vector<Classifi
     for (const auto & word : words(text, max_words)) {
         const auto position = static_cast<int32_t>(result.ids.size());
         emit(word.text);
-        if (entities) {
+        if (kind != SchemaKind::Classification) {
             if (result.ids.size() == static_cast<size_t>(position)) {
                 throw std::invalid_argument("Text word produced no subwords; span alignment would be ambiguous");
             }

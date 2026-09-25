@@ -355,6 +355,81 @@ def span_contract(converter, extract, c_test, root, backend, fast_metal):
         raise AssertionError("Missing span-conditioning tensor accepted")
     failure([extract], root / "model-F32.gguf", "--text", "hello", "--labels", "term")
 
+def record_contract(converter, extract, c_test, root, backend, fast_metal):
+    fixtures = json.loads((Path(__file__).parent / "fixtures" / "tiny_records_parity.json").read_text(encoding="utf8"))["fixtures"]
+    for dtype in ("F32", "F16"):
+        models = {}
+        for expected in fixtures:
+            case = expected["case"]
+            count = case["synthetic_count"]
+            if count not in models:
+                tensors = create_checkpoint(root, hidden=8, layers=2, dtype=dtype, spans=True, record_count=count, records=True)
+                model = root / f"records-{dtype}-{count}.gguf"
+                converter.convert(root, model)
+                preserved_tensors(model, tensors, dtype)
+                subprocess.run([c_test, "--records", str(model), str(count)], check=True)
+                models[count] = model
+            model = models[count]
+            args = ["--text", case["text"], "--structure", case["structure"], "--threads", "2", "--max-tokens", "2048", "--debug"]
+            for field in case["fields"]:
+                args += ["--single-field" if field["type"] == "single" else "--field", field["name"]]
+                if "description" in field:
+                    args += ["--description", field["name"] + "=" + field["description"]]
+            for name, option in (("threshold", "--threshold"), ("top_k", "--top-k"), ("max_words", "--max-words")):
+                if name in case:
+                    args += [option, str(case[name])]
+            if case.get("allow_overlap"):
+                args += ["--allow-overlap"]
+            result = json.loads(run([extract], model, *args))
+            assert result["backend"] == backend and result["offset_unit"] == "utf8_bytes"
+            for key in ("structure", "input_ids", "field_positions", "word_positions", "start_words", "end_words", "predicted_count", "max_span_width"):
+                assert result[key] == expected[key], (dtype, count, key)
+            assert len(result["record_logits"]) == count * len(case["fields"]) * len(result["start_words"])
+            if not fast_metal:
+                for key in ("record_logits", "count_logits"):
+                    assert_close(result[key], expected[key], 5e-5 if dtype == "F32" else 5e-3, f"{dtype} count {count} {key}")
+            if dtype == "F32" and not fast_metal:
+                assert len(result["records"]) == len(expected["records"])
+            source = case["text"].encode("utf8")
+            for r, record in enumerate(result["records"]):
+                assert 0 <= record["slot_index"] < count
+                assert list(record["fields"]) == [f["name"] for f in case["fields"]]
+                for field in case["fields"]:
+                    values = record["fields"][field["name"]]
+                    if field["type"] == "single":
+                        values = [] if values is None else [values]
+                    for span in values:
+                        assert 0 <= span["start"] < span["end"] <= len(source)
+                        assert source[span["start"]:span["end"]].decode("utf8") == span["text"]
+                    if dtype == "F32" and not fast_metal:
+                        ref_record = expected["records"][r]
+                        assert record["slot_index"] == ref_record["slot_index"]
+                        ref = ref_record["fields"][field["name"]]
+                        if field["type"] == "single":
+                            ref = [] if ref is None else [ref]
+                        assert [(v["text"], v["start"], v["end"]) for v in values] == [
+                            (v["text"], v["start"], v["end"]) for v in ref], (
+                                dtype, case["structure"], count, record["slot_index"], field["name"], values, ref)
+        model = models[2]
+        base = ["--text", "hello world", "--structure", "requests", "--field", "terms", "--threshold", "0"]
+        for bad in (["--max-records", "0"], ["--max-records", "20"], ["--max-records", "1"],
+                    ["--labels", "a,b"], ["--label", "x"], ["--field", "terms"],
+                    ["--structure", "again"], ["--single-field", "terms"]):
+            failure([extract], model, *base, *bad)
+        failure([extract], model, "--text", "x", "--field", "terms")
+        failure([extract], model, "--text", "x", "--structure", "requests")
+        failure([extract], model, "--text", "x", "--labels", "a", "--max-records", "2")
+        record = json.loads(run([extract], model, *base, "--debug"))
+        cap = len(record["input_ids"])
+        exact = json.loads(run([extract], model, *base, "--debug", "--max-tokens", str(cap)))
+        assert exact == record
+        failure([extract], model, *base, "--max-tokens", str(cap - 1))
+        text_file = root / "records-input.txt"
+        text_file.write_text("hello world", encoding="utf8")
+        via_file = json.loads(run([extract], model, "--text-file", str(text_file), *base[2:], "--debug"))
+        assert via_file == record
+    failure([extract], root / "model-F32.gguf", "--text", "x", "--structure", "requests", "--field", "terms")
+
 
 def main(converter_path, executable, c_test, expected_backend=None, fast_metal=False, extract=None):
     parity_environment_contract()
@@ -426,6 +501,7 @@ def main(converter_path, executable, c_test, expected_backend=None, fast_metal=F
         subprocess.run([c_test, str(large_model), backend], check=True)
         if extract:
             span_contract(converter, extract, c_test, root, backend, fast_metal)
+            record_contract(converter, extract, c_test, root, backend, fast_metal)
         negative_conversion(converter, binary, root)
     if fast_metal:
         print("Conversion, C API and CLI checks passed on fast Metal; strict encoder parity was not run")

@@ -2,6 +2,7 @@
 
 import json
 import math
+import random
 import struct
 
 
@@ -16,7 +17,7 @@ def write_safetensors(path, tensors, dtype="F32"):
     path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + payload)
 
 
-def create_checkpoint(root, hidden=2, layers=1, dtype="F32", compact_tokens=False, spans=False):
+def create_checkpoint(root, hidden=2, layers=1, dtype="F32", compact_tokens=False, spans=False, record_count=1, records=False):
     (root / "encoder_config").mkdir(exist_ok=True)
     config = {
         "model_type": "deberta-v2", "hidden_size": hidden, "num_hidden_layers": layers,
@@ -61,8 +62,13 @@ def create_checkpoint(root, hidden=2, layers=1, dtype="F32", compact_tokens=Fals
 
     def tensor(name, shape, norm=False):
         seed = sum((i + 1) * ord(c) for i, c in enumerate(name)) % 997
-        values = [(1.0 if norm else 0.0) + 0.13 * math.sin(seed + i * 0.71)
-                  for i in range(math.prod(shape))]
+        if records:
+            # Uncorrelated record fixtures avoid near-tied span scores from sinusoidal weights.
+            generator = random.Random(seed)
+            values = [(1.0 if norm else 0.0) + generator.uniform(-0.3, 0.3) for _ in range(math.prod(shape))]
+        else:
+            values = [(1.0 if norm else 0.0) + 0.13 * math.sin(seed + i * 0.71)
+                      for i in range(math.prod(shape))]
         tensors[name] = (shape, values)
 
     tensor("encoder.embeddings.word_embeddings.weight", [config["vocab_size"], hidden])
@@ -103,7 +109,9 @@ def create_checkpoint(root, hidden=2, layers=1, dtype="F32", compact_tokens=Fals
         tensor("count_pred.0.weight", [2 * hidden, hidden])
         tensor("count_pred.0.bias", [2 * hidden])
         tensors["count_pred.2.weight"] = ([20, 2 * hidden], [0.] * (40 * hidden))
-        tensors["count_pred.2.bias"] = ([20], [0., 1.] + [0.] * 18)
+        if not 0 <= record_count <= 19:
+            raise ValueError("Synthetic record count must be 0..19")
+        tensors["count_pred.2.bias"] = ([20], [1. if i == record_count else 0. for i in range(20)])
         tensor("count_embed.pos_embedding.weight", [20, hidden])
         for side in ("ih", "hh"):
             tensor(f"count_embed.gru.weight_{side}_l0", [3 * hidden, hidden])

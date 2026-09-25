@@ -12,6 +12,7 @@ The C++ library, CLI and `gliner-bench` do not embed or invoke Python. Python to
 | `gliner-benchmark` | Python 3.10+ standard library | Native benchmark output/statistics, modes, warmup/sample counts and result consistency |
 | `gliner-real-parity` (explicit opt-in) | Python plus `tests/requirements-parity.txt`, local weights and GGUF | Live upstream reference comparison for all 13 single/joint cases |
 | `gliner-real-span-parity` (explicit opt-in) | Same reference environment, span-enabled GGUF | Six extraction cases: word/label routing, every candidate logit, count gate and exact decoded spans |
+| `gliner-real-record-parity` (explicit opt-in) | Same reference environment, span-enabled GGUF | Seven repeated-record cases: counts, every recurrent slot/field logit, decoded fields and original offsets |
 
 The full C API checks run against tiny generated models during `gliner-conversion`; the standalone native smoke test does not replace this inference coverage.
 
@@ -55,7 +56,7 @@ The tool compares exact token IDs, marker positions and task ranges; embeddings 
 
 For CTest integration, set `GLINER_PARITY_CHECKPOINT` and `GLINER_PARITY_GGUF` to absolute local paths and `Python3_EXECUTABLE` to the oracle environment's interpreter. Leave `GLINER_PYTHON_TESTS=ON`. No model is downloaded automatically.
 
-For extraction, run the same tool with `--spans-only`, a reconverted span-capable GGUF and `gliner-extract` instead of `gliner-classify`. Set `GLINER_SPAN_PARITY_GGUF` alongside `GLINER_PARITY_CHECKPOINT` to register this in CTest. The reference uses upstream `SpanRepLayer`, `CountLSTM`, the count head and overlap decoder; there is no separate Python extraction implementation in production.
+For extraction, run the same tool with `--spans-only` or `--records-only`, a span-capable GGUF and `gliner-extract` instead of `gliner-classify`. Set `GLINER_SPAN_PARITY_GGUF` alongside `GLINER_PARITY_CHECKPOINT` to register both in CTest. The reference uses upstream `SpanRepLayer`, `CountLSTM`, the count head and overlap decoder; there is no separate Python extraction implementation in production. Structured scoring checks the recurrent state and positional embedding for every predicted slot, not a repeated copy of the first entity step.
 
 ## Fixtures
 
@@ -70,11 +71,15 @@ The checked-in fixtures are deterministic reference outputs, not downloaded mode
   --write-golden .\tests\fixtures\tiny_cuda_parity.json
 .\build-oracle\Scripts\python.exe .\tests\test_parity.py --spans-only `
   --write-golden .\tests\fixtures\tiny_spans_parity.json
+.\build-oracle\Scripts\python.exe .\tests\test_parity.py --records-only `
+  --write-golden .\tests\fixtures\tiny_records_parity.json
 ```
 
 Fixtures record upstream/tool provenance. The 32-wide, 10/30-token CUDA fixtures exercise a small-matrix dispatch boundary absent from the original 8-wide fixtures. Tiny F32 uses `atol=rtol=5e-5`; F16 storage uses `5e-3` against the F32 goldens. Do not loosen tolerances to hide backend precision changes. Real-checkpoint F16 parity remains separate work.
 
 Span fixtures compare all raw logits under the same numerical tolerances. Exact greedy decoded-span agreement is checked for synthetic F32; F16 tests compare raw scores and result/offset validity because close scores can reorder after weight rounding. Both dtypes exercise C API ownership/cleanup, empty results, thresholds, overlap/top-k and single-pass behavior. Native offsets are half-open UTF-8 bytes; the reference converts Python character offsets and excludes synthetic suffix tokens.
+
+Record fixtures use deterministic uncorrelated synthetic weights and controlled count logits for counts 0, 1, 2, 3 and 19. This exercises the count ceiling and GRU recurrence without relying on a checkpoint to naturally predict every count. Tests compare all slot logits under the existing F32/F16 tolerances, F32 decoded field membership, list/single outputs, empty records, Unicode offsets, repeated state reuse and classification/entity interleaving. Callback counts prove the encoder runs once, including the maximum-count case. A max-record safety-cap violation must clear results rather than truncate.
 
 ## Backend policies
 

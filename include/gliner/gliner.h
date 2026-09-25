@@ -110,6 +110,51 @@ struct gliner_span_scores {
 
 struct gliner_span_params gliner_default_span_params(void);
 
+enum gliner_field_type {
+    GLINER_FIELD_LIST = 0,
+    GLINER_FIELD_SINGLE = 1,
+};
+
+struct gliner_record_field {
+    const char * name;
+    const char * description; // optional, encoded in field declaration order
+    enum gliner_field_type type;
+};
+
+struct gliner_record_params {
+    int n_threads;
+    int max_tokens;
+    int max_words;
+    float threshold;
+    int max_records; // safety limit, 1..19; exceeding it is an error, not truncation
+    int max_spans_per_field; // list fields: 0 means all, after overlap suppression
+    int allow_overlap; // 0 or 1, applied within each field and record
+};
+
+struct gliner_record {
+    int slot_index; // original predicted slot; all-empty records are omitted
+    int span_offset; // range in gliner_get_record_spans()
+    int n_spans;
+};
+
+// Raw logits are [predicted_count, n_fields, n_candidates], in that order.
+// A zero predicted count has no record logits; count_logits is always available.
+struct gliner_record_scores {
+    int n_fields;
+    int n_candidates;
+    int n_words;
+    int max_width;
+    int predicted_count;
+    const int32_t * field_positions;
+    const int32_t * word_positions;
+    const int32_t * start_words;
+    const int32_t * end_words;
+    const float * logits;
+    const float * count_logits; // 20 classes, counts 0..19
+};
+
+struct gliner_record_params gliner_default_record_params(void);
+
 // Optional diagnostic callback: layer 0 is embeddings; 1..n_layers are encoder outputs.
 // Values are row-major [n_tokens, hidden_size], valid only during the callback.
 // Called synchronously on the scoring thread. Do not re-enter this state from the callback.
@@ -206,6 +251,28 @@ int gliner_extract_spans(
 int gliner_n_spans(const struct gliner_state * state);
 const struct gliner_span * gliner_get_spans(const struct gliner_state * state);
 const struct gliner_span_scores * gliner_get_span_scores(const struct gliner_state * state);
+
+// Extract repeated records of one structure, without caller-supplied topic groups.
+// All fields must have unique nonempty names; list fields select multiple spans,
+// single fields select the best surviving span. Missing fields have no span entries.
+// One encoder pass predicts the count; a second head-only graph conditions each slot.
+// Requires the same markerV0/count_lstm metadata as gliner_extract_spans.
+int gliner_extract_records(
+    const struct gliner_context * ctx,
+    struct gliner_state * state,
+    const char * text,
+    const char * structure,
+    const struct gliner_record_field * fields,
+    int n_fields,
+    const struct gliner_record_params * params);
+
+// State-owned results, valid until the next inference/free. All other inference
+// operations clear these. label_index in record spans is the input FIELD index.
+// Fields are decoded independently; records are not deduplicated across slots.
+int gliner_n_records(const struct gliner_state * state);
+const struct gliner_record * gliner_get_records(const struct gliner_state * state);
+const struct gliner_span * gliner_get_record_spans(const struct gliner_state * state);
+const struct gliner_record_scores * gliner_get_record_scores(const struct gliner_state * state);
 
 // Token IDs from the last successful classification/extraction (empty after states-only or failure).
 int gliner_n_tokens(const struct gliner_state * state);
