@@ -1,6 +1,8 @@
 #include "internal.h"
 
 #include <fstream>
+#include <cmath>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 
@@ -47,29 +49,84 @@ std::string GgufFile::string(const char * key) const {
 
 int GgufFile::tensor_count() const { return static_cast<int>(gguf_get_n_tensors(ctx_)); }
 
-ggml_tensor * GgufFile::read_tensor(ggml_context * ctx, const char * name,
-                                    std::vector<unsigned char> & data) const {
-    const int64_t id = gguf_find_tensor(ctx_, name);
-    if (id < 0) throw std::runtime_error(std::string("Missing tensor: ") + name);
+bool GgufFile::has(const char * key) const { return gguf_find_key(ctx_, key) >= 0; }
+
+float GgufFile::f32(const char * key) const {
+    const int64_t id = gguf_find_key(ctx_, key);
+    if (id < 0 || gguf_get_kv_type(ctx_, id) != GGUF_TYPE_FLOAT32) {
+        throw std::runtime_error(std::string("Missing GGUF f32 key: ") + key);
+    }
+    const float value = gguf_get_val_f32(ctx_, id);
+    if (!std::isfinite(value)) throw std::runtime_error(std::string("Nonfinite GGUF value: ") + key);
+    return value;
+}
+
+int64_t GgufFile::array(const char * key, gguf_type type) const {
+    const int64_t id = gguf_find_key(ctx_, key);
+    if (id < 0 || gguf_get_kv_type(ctx_, id) != GGUF_TYPE_ARRAY || gguf_get_arr_type(ctx_, id) != type) {
+        throw std::runtime_error(std::string("Missing or invalid GGUF array: ") + key);
+    }
+    return id;
+}
+
+std::vector<std::string> GgufFile::strings(const char * key) const {
+    const int64_t id = array(key, GGUF_TYPE_STRING);
+    std::vector<std::string> result;
+    for (size_t i = 0; i < gguf_get_arr_n(ctx_, id); ++i) result.emplace_back(gguf_get_arr_str(ctx_, id, i));
+    return result;
+}
+
+std::vector<uint32_t> GgufFile::integers(const char * key) const {
+    const int64_t id = array(key, GGUF_TYPE_UINT32);
+    std::vector<uint32_t> result(gguf_get_arr_n(ctx_, id));
+    if (!result.empty()) std::memcpy(result.data(), gguf_get_arr_data(ctx_, id), result.size() * sizeof(uint32_t));
+    return result;
+}
+
+std::vector<double> GgufFile::doubles(const char * key) const {
+    const int64_t id = array(key, GGUF_TYPE_FLOAT64);
+    std::vector<double> result(gguf_get_arr_n(ctx_, id));
+    if (!result.empty()) std::memcpy(result.data(), gguf_get_arr_data(ctx_, id), result.size() * sizeof(double));
+    return result;
+}
+
+ggml_tensor * GgufFile::tensor(ggml_context * ctx, const std::string & name,
+                             std::initializer_list<int64_t> shape) const {
+    const int64_t id = gguf_find_tensor(ctx_, name.c_str());
+    if (id < 0) throw std::runtime_error("Missing tensor: " + name);
     const ggml_type type = gguf_get_tensor_type(ctx_, id);
     if (type != GGML_TYPE_F32 && type != GGML_TYPE_F16) {
-        throw std::runtime_error(std::string("Unsupported tensor type: ") + name);
+        throw std::runtime_error("Unsupported tensor type: " + name);
     }
     const int64_t * dims = gguf_get_tensor_ne(ctx_, id);
-    const std::string tensor_name(name);
-    const int n_dims = tensor_name.size() >= 7 && tensor_name.substr(tensor_name.size() - 7) == ".weight" ? 2 : 1;
-    ggml_tensor * tensor = ggml_new_tensor(ctx, type, n_dims, dims);
+    for (size_t i = 0; i < GGML_MAX_DIMS; ++i) {
+        const int64_t expected = i < shape.size() ? shape.begin()[i] : 1;
+        if (dims[i] != expected || expected <= 0) throw std::runtime_error("Invalid tensor shape: " + name);
+    }
+    ggml_tensor * tensor = ggml_new_tensor(ctx, type, static_cast<int>(shape.size()), dims);
     if (!tensor) throw std::runtime_error("Failed to allocate tensor");
-    ggml_set_name(tensor, name);
+    ggml_set_name(tensor, name.c_str());
     const size_t bytes = gguf_get_tensor_size(ctx_, id);
     if (ggml_nbytes(tensor) != bytes) throw std::runtime_error("GGUF tensor size mismatch");
+    return tensor;
+}
+
+void GgufFile::load_weights(ggml_context * ctx) const {
     std::ifstream input(path_, std::ios::binary);
     if (!input) throw std::runtime_error("Cannot reopen GGUF file");
-    input.seekg(static_cast<std::streamoff>(gguf_get_data_offset(ctx_) + gguf_get_tensor_offset(ctx_, id)));
-    data.resize(bytes);
-    input.read(reinterpret_cast<char *>(data.data()), static_cast<std::streamsize>(bytes));
-    if (!input) throw std::runtime_error(std::string("Cannot read tensor: ") + name);
-    return tensor;
+    std::vector<unsigned char> data(8 * 1024 * 1024);
+    for (auto * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
+        const int64_t id = gguf_find_tensor(ctx_, tensor->name);
+        input.seekg(static_cast<std::streamoff>(gguf_get_data_offset(ctx_) + gguf_get_tensor_offset(ctx_, id)));
+        const size_t bytes = ggml_nbytes(tensor);
+        for (size_t offset = 0; offset < bytes;) {
+            const size_t chunk = std::min(data.size(), bytes - offset);
+            input.read(reinterpret_cast<char *>(data.data()), static_cast<std::streamsize>(chunk));
+            if (!input) throw std::runtime_error(std::string("Cannot read tensor: ") + tensor->name);
+            ggml_backend_tensor_set(tensor, data.data(), offset, chunk);
+            offset += chunk;
+        }
+    }
 }
 
 } // namespace gliner

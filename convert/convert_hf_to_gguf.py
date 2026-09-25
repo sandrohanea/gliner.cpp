@@ -7,8 +7,11 @@ F32/F16 format; GGUF dimensions are reversed to match ggml's layout.
 
 import argparse
 import json
+import math
 import struct
+import unicodedata
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 
@@ -18,6 +21,7 @@ KV_U32 = 4
 KV_STRING = 8
 KV_ARRAY = 9
 KV_F32 = 6
+KV_F64 = 12
 ALIGNMENT = 32
 CHUNK = 8 * 1024 * 1024
 
@@ -57,7 +61,13 @@ def read_json(path):
 def checkpoint_files(directory):
     index = directory / "model.safetensors.index.json"
     if index.exists():
-        names = sorted(set(read_json(index)["weight_map"].values()))
+        mapping = read_json(index).get("weight_map")
+        if not isinstance(mapping, dict) or not mapping:
+            raise ValueError("Invalid safetensors weight_map")
+        names = sorted(set(mapping.values()))
+        for name in names:
+            if not isinstance(name, str) or not (directory / name).resolve().is_relative_to(directory.resolve()):
+                raise ValueError("Shard paths must stay inside the checkpoint directory")
         return [directory / name for name in names]
     single = directory / "model.safetensors"
     if single.exists():
@@ -76,6 +86,7 @@ def tensors_in(path):
         header = json.loads(file.read(header_size))
         data_start = 8 + header_size
         file_size = path.stat().st_size
+    intervals = []
     for name, spec in header.items():
         if name == "__metadata__":
             continue
@@ -84,6 +95,10 @@ def tensors_in(path):
             raise ValueError(f"Unsupported tensor {name} dtype {dtype}; expected F32 or F16")
         shape = tuple(spec["shape"])
         begin, end = spec["data_offsets"]
+        if not 1 <= len(shape) <= 4 or any(type(d) is not int for d in shape):
+            raise ValueError(f"Invalid shape for {name}: {shape}")
+        if type(begin) is not int or type(end) is not int:
+            raise ValueError(f"Invalid data offsets for {name}")
         element_size = 4 if dtype == "F32" else 2
         expected = element_size
         for dim in shape:
@@ -92,8 +107,100 @@ def tensors_in(path):
             expected *= dim
         if end - begin != expected or begin < 0 or data_start + end > file_size:
             raise ValueError(f"Invalid data offsets for {name}")
+        intervals.append((begin, end))
         yield Tensor(name, path, data_start + begin, expected, shape,
                      GGUF_F32 if dtype == "F32" else GGUF_F16)
+    previous = 0
+    for begin, end in sorted(intervals):
+        if begin != previous:
+            raise ValueError(f"Overlapping or non-contiguous tensor data in {path}")
+        previous = end
+    if data_start + previous != file_size:
+        raise ValueError(f"Unindexed tensor data in {path}")
+
+
+@lru_cache(maxsize=1)
+def unicode_tables():
+    """Freeze Python's word splitting and full lowercasing semantics in the GGUF."""
+    lower_from, lower_to, ranges = [], [], []
+    start, previous = 0, 0
+    for cp in range(0x110000):
+        ch = chr(cp)
+        lowered = ch.lower()
+        if lowered != ch:
+            lower_from.append(cp)
+            lower_to.append(lowered)
+        cased = ch.lower() != ch.upper()
+        # These contexts distinguish Case_Ignorable, including cased combining marks.
+        ignorable = ("A\u03a3" + ch).lower()[1] == "\u03c2" and (
+            "A\u03a3" + ch + "A").lower()[1] == "\u03c3"
+        flags = int(ch.isalnum() or ch == "_") | (int(ch.isspace()) << 1)
+        flags |= int(cased) << 2 | int(ignorable) << 3
+        if flags != previous:
+            if previous:
+                ranges.extend((start, cp - 1, previous))
+            start, previous = cp, flags
+    if previous:
+        ranges.extend((start, 0x10ffff, previous))
+    return lower_from, lower_to, ranges
+
+
+def validate_encoder(encoder):
+    for key in ("hidden_size", "num_attention_heads", "num_hidden_layers",
+                "intermediate_size", "max_position_embeddings", "vocab_size"):
+        if type(encoder.get(key)) is not int or not 0 < encoder[key] < 2**31:
+            raise ValueError(f"Invalid encoder {key}")
+    hidden = encoder["hidden_size"]
+    if hidden % encoder["num_attention_heads"]:
+        raise ValueError("hidden_size must be divisible by num_attention_heads")
+    required = {
+        "hidden_act": "gelu", "position_biased_input": False,
+        "type_vocab_size": 0, "relative_attention": True, "share_att_key": True,
+        "norm_rel_ebd": "layer_norm",
+    }
+    for key, value in required.items():
+        if encoder.get(key) != value:
+            raise ValueError(f"Unsupported encoder {key}: expected {value!r}")
+    if sorted(encoder.get("pos_att_type", [])) != ["c2p", "p2c"]:
+        raise ValueError("Expected c2p and p2c position attention")
+    if encoder.get("conv_kernel_size", 0) or encoder.get("embedding_size", hidden) != hidden:
+        raise ValueError("Convolution and projected embeddings are not supported")
+    if encoder.get("attention_head_size", hidden // encoder["num_attention_heads"]) != (
+            hidden // encoder["num_attention_heads"]):
+        raise ValueError("Unsupported attention_head_size")
+    buckets = encoder.get("position_buckets", -1)
+    relative = encoder.get("max_relative_positions", -1)
+    relative = relative if relative > 0 else encoder["max_position_embeddings"]
+    if type(buckets) is not int or buckets < 4 or buckets % 2 or relative <= buckets // 2 + 1:
+        raise ValueError("Invalid relative position buckets")
+    eps = encoder.get("layer_norm_eps", 1e-7)
+    if not math.isfinite(eps) or eps <= 0:
+        raise ValueError("Invalid layer_norm_eps")
+    return relative
+
+
+def encoder_shapes(encoder):
+    h, f = encoder["hidden_size"], encoder["intermediate_size"]
+    shapes = {
+        "encoder.embeddings.word_embeddings.weight": (encoder["vocab_size"], h),
+        "encoder.encoder.rel_embeddings.weight": (2 * encoder["position_buckets"], h),
+    }
+    for prefix in ("encoder.embeddings.LayerNorm", "encoder.encoder.LayerNorm"):
+        shapes[prefix + ".weight"] = (h,)
+        shapes[prefix + ".bias"] = (h,)
+    for i in range(encoder["num_hidden_layers"]):
+        prefix = f"encoder.encoder.layer.{i}."
+        for name, width, height in (
+            ("attention.self.query_proj", h, h), ("attention.self.key_proj", h, h),
+            ("attention.self.value_proj", h, h), ("attention.output.dense", h, h),
+            ("intermediate.dense", h, f), ("output.dense", f, h),
+        ):
+            shapes[prefix + name + ".weight"] = (height, width)
+            shapes[prefix + name + ".bias"] = (height,)
+        for name in ("attention.output.LayerNorm", "output.LayerNorm"):
+            shapes[prefix + name + ".weight"] = (h,)
+            shapes[prefix + name + ".bias"] = (h,)
+    return shapes
 
 
 def metadata(directory):
@@ -106,40 +213,92 @@ def metadata(directory):
     encoder = read_json(encoder_path)
     if encoder.get("model_type") != "deberta-v2":
         raise ValueError("Only DeBERTa-v2/v3 encoders are supported")
+    relative = validate_encoder(encoder)
+    if model_config.get("token_pooling", "first") != "first":
+        raise ValueError("Only first-subword pooling is supported")
 
     tokenizer = read_json(directory / "tokenizer.json")
     if tokenizer.get("model", {}).get("type") != "Unigram":
         raise ValueError("Only SentencePiece Unigram tokenizer.json files are supported")
+    normalizer = {"type": "Sequence", "normalizers": [
+        {"type": "Replace", "pattern": {"Regex": r"\s{2,}|[\n\r\t]"}, "content": " "},
+        {"type": "NFC"}, {"type": "Strip", "strip_left": False, "strip_right": True}]}
+    pretokenizer = {"type": "Sequence", "pretokenizers": [
+        {"type": "Metaspace", "replacement": "\u2581", "prepend_scheme": "always", "split": True}]}
+    if tokenizer.get("normalizer") != normalizer or tokenizer.get("pre_tokenizer") != pretokenizer:
+        raise ValueError("Unsupported tokenizer normalizer or pretokenizer; expected Decide NFC/Metaspace")
+    if tokenizer["model"].get("byte_fallback", False):
+        raise ValueError("Unigram byte fallback is not supported")
     vocab = tokenizer["model"]["vocab"]
     tokens = [item[0] for item in vocab]
     scores = [float(item[1]) for item in vocab]
+    if not tokens or len(set(tokens)) != len(tokens) or any(not t for t in tokens):
+        raise ValueError("Unigram vocabulary must be nonempty and unique")
+    if any(not math.isfinite(s) for s in scores):
+        raise ValueError("Unigram scores must be finite")
+    unk_id = tokenizer["model"].get("unk_id")
+    if type(unk_id) is not int or not 0 <= unk_id < len(tokens):
+        raise ValueError("Invalid Unigram unk_id")
+    added_ids, added_tokens = [], []
     for item in tokenizer.get("added_tokens", []):
         token_id = int(item["id"])
+        if any(item.get(k, False) for k in ("single_word", "lstrip", "rstrip")):
+            raise ValueError("Unsupported added-token matching flags")
+        if item.get("normalized", False) and item["content"] != tokens[unk_id]:
+            raise ValueError("Only the unknown token may have normalized matching")
+        if token_id < 0 or token_id > len(tokens) or token_id in added_ids:
+            raise ValueError(f"Invalid added token ID {token_id}")
+        added_ids.append(token_id)
+        added_tokens.append(item["content"])
         if token_id < len(tokens):
             if tokens[token_id] != item["content"]:
                 raise ValueError(f"Conflicting added token ID {token_id}")
             continue
-        while len(tokens) < token_id:
-            tokens.append("")
-            scores.append(0.0)
         tokens.append(item["content"])
         scores.append(0.0)
+    if len(tokens) != encoder["vocab_size"]:
+        raise ValueError("Tokenizer vocabulary does not match encoder vocab_size")
+    if len(set(tokens)) != len(tokens):
+        raise ValueError("Duplicate added token content")
+    for marker in ("[P]", "[L]", "[SEP_TEXT]", "[DESCRIPTION]"):
+        if marker not in added_tokens:
+            raise ValueError(f"Missing structural token {marker}")
+    lower_from, lower_to, ranges = unicode_tables()
 
     kv = [
         ("general.architecture", KV_STRING, "gliner2.5-decide"),
         ("general.name", KV_STRING, directory.name),
         ("gliner.architecture", KV_STRING, "span"),
         ("gliner.token_pooling", KV_STRING, model_config.get("token_pooling", "first")),
+        ("gliner.format_version", KV_U32, 2),
         ("deberta.hidden_size", KV_U32, int(encoder["hidden_size"])),
         ("deberta.num_hidden_layers", KV_U32, int(encoder["num_hidden_layers"])),
         ("deberta.num_attention_heads", KV_U32, int(encoder["num_attention_heads"])),
         ("deberta.intermediate_size", KV_U32, int(encoder["intermediate_size"])),
         ("deberta.max_position_embeddings", KV_U32, int(encoder["max_position_embeddings"])),
+        ("deberta.vocab_size", KV_U32, encoder["vocab_size"]),
+        ("deberta.position_buckets", KV_U32, encoder["position_buckets"]),
+        ("deberta.max_relative_positions", KV_U32, relative),
+        ("deberta.layer_norm_eps", KV_F32, float(encoder.get("layer_norm_eps", 1e-7))),
+        ("deberta.variant", KV_STRING, "decide-v1"),
         ("tokenizer.ggml.model", KV_STRING, "unigram"),
         ("tokenizer.ggml.tokens", KV_ARRAY, (KV_STRING, tokens)),
         ("tokenizer.ggml.scores", KV_ARRAY, (KV_F32, scores)),
+        ("tokenizer.gliner.scores", KV_ARRAY, (KV_F64, [float(v[1]) for v in vocab])),
+        ("tokenizer.gliner.unknown_id", KV_U32, unk_id),
+        ("tokenizer.gliner.added_ids", KV_ARRAY, (KV_U32, added_ids)),
+        ("tokenizer.gliner.added_tokens", KV_ARRAY, (KV_STRING, added_tokens)),
+        ("tokenizer.gliner.pipeline", KV_STRING, "decide-nfc-v1"),
+        ("tokenizer.gliner.unicode_version", KV_STRING, unicodedata.unidata_version),
+        ("tokenizer.gliner.lower_from", KV_ARRAY, (KV_U32, lower_from)),
+        ("tokenizer.gliner.lower_to", KV_ARRAY, (KV_STRING, lower_to)),
+        ("tokenizer.gliner.unicode_ranges", KV_ARRAY, (KV_U32, ranges)),
     ]
-    return kv
+    h = encoder["hidden_size"]
+    shapes = encoder_shapes(encoder)
+    shapes.update({"classifier.0.weight": (2 * h, h), "classifier.0.bias": (2 * h,),
+                   "classifier.2.weight": (1, 2 * h), "classifier.2.bias": (1,)})
+    return kv, shapes
 
 
 def write_kv(file, key, kind, value):
@@ -149,6 +308,8 @@ def write_kv(file, key, kind, value):
         file.write(gguf_string(value))
     elif kind == KV_U32:
         file.write(u32(value))
+    elif kind == KV_F32:
+        file.write(struct.pack("<f", value))
     elif kind == KV_ARRAY:
         item_kind, items = value
         file.write(u32(item_kind))
@@ -158,6 +319,10 @@ def write_kv(file, key, kind, value):
                 file.write(gguf_string(item))
             elif item_kind == KV_F32:
                 file.write(struct.pack("<f", item))
+            elif item_kind == KV_F64:
+                file.write(struct.pack("<d", item))
+            elif item_kind == KV_U32:
+                file.write(u32(item))
             else:
                 raise ValueError(f"Unsupported array kind {item_kind}")
     else:
@@ -165,7 +330,7 @@ def write_kv(file, key, kind, value):
 
 
 def convert(directory, output):
-    kv = metadata(directory)
+    kv, required_shapes = metadata(directory)
     tensors = []
     seen = set()
     for path in checkpoint_files(directory):
@@ -177,10 +342,19 @@ def convert(directory, output):
             seen.add(tensor.name)
             tensors.append(tensor)
     tensors.sort(key=lambda tensor: tensor.name)
-    for required in ("classifier.0.weight", "classifier.0.bias",
-                     "classifier.2.weight", "classifier.2.bias"):
-        if required not in seen:
-            raise ValueError(f"Missing required classification tensor: {required}")
+    by_name = {tensor.name: tensor for tensor in tensors}
+    index = directory / "model.safetensors.index.json"
+    if index.exists():
+        mapping = read_json(index)["weight_map"]
+        if set(mapping) != seen or any(
+            by_name[name].path.resolve() != (directory / shard).resolve() for name, shard in mapping.items()
+        ):
+            raise ValueError("Safetensors index does not match shard contents")
+    for required, shape in required_shapes.items():
+        if required not in by_name:
+            raise ValueError(f"Missing required tensor: {required}")
+        if by_name[required].shape != shape:
+            raise ValueError(f"Invalid shape for {required}: expected {shape}")
 
     offset = 0
     with output.open("wb") as target:

@@ -68,5 +68,6 @@ vcpkg_installed/
 Testing/
 .cache/
 models/
+ggml/
 *.gguf
 __pycache__/

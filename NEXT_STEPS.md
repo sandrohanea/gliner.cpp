@@ -1,9 +1,19 @@
-# Next steps toward GGUF-only text classification
+# Next steps
 
-1. **Tokenizer parity.** Implement the checkpoint's SentencePiece Unigram normalizer, pretokenization, unknown handling, and special token IDs from `tokenizer.json`. The upstream processor lowercases whitespace split text words, builds `("[P]" task "(" "[L]" label ... ")") [SEP_TEXT] text`, tokenizes each segment, and routes the first subword of every marker. Add golden token IDs and marker positions for ASCII, Unicode, punctuation, descriptions, and truncation.
-2. **DeBERTa-v3-large forward graph.** Load encoder tensors from GGUF and implement embeddings, relative positional disentangled attention, layer normalization, and feed-forward layers in GGML. Match the checkpoint's `encoder_config/config.json`, including position attention settings and encoder normalization. Compare every layer against Transformers on a short fixture before optimizing.
-3. **End to end classification.** Connect tokenizer marker positions to encoder states and the existing GGML classifier. Add `gliner_classify_text(context, state, ...)` to the C API and a `--text`, `--task`, `--labels` CLI path. Make model loading validate every tensor required by the encoder and fail clearly on unsupported configurations.
-4. **Parity and decoding.** Compare token IDs, hidden states, raw logits, and chosen labels against upstream on a held-out set. Add exclusive softmax, multi-label thresholds, task prompts, label descriptions, and the upstream decision decoder. Set numerical tolerances separately for F32, F16, and later quantized weights.
-5. **Performance and packaging.** Add quantization, memory-mapped tensors, batching, context-length controls, thread tuning, and backend selection after F32 parity. Benchmark CPU and Metal against upstream for realistic schema sizes.
+## Implemented
 
-The current CLI intentionally requires precomputed `[L]` states so it cannot return plausible looking classifications from an incomplete encoder.
+- **GGUF-only text classification:** C++ schema construction, Unicode word splitting/lowercasing, NFC/Metaspace Unigram tokenization, marker routing, DeBERTa embeddings and every encoder layer, and contextual classification.
+- **Model-format validation:** application format version 2 preserves all tensors and carries required encoder/tokenizer behavior. Legacy files remain head-only; unsupported or incomplete new models fail explicitly.
+- **C API and CLI:** `gliner_classify_text`, per-state diagnostics, `--text`/`--text-file`, prompts, descriptions, word truncation and explicit token limits. The precomputed `--states` path is retained.
+- **Basic decoding:** exclusive softmax/argmax, independent sigmoid thresholds and probability temperature, with unmodified raw logits.
+- **Parity:** committed synthetic token/hidden-state/logit fixtures and optional live checks against the real F32 Decide checkpoint. Eight real cases match token IDs and routing exactly, with maximum observed absolute hidden-state error below `3e-5` across all 24 layers. See README for revisions, tolerances and reproduction commands.
+
+## Remaining
+
+1. **Broader parity coverage.** Add a held-out application corpus, longer contexts, more adversarial Unicode/schema cases and real-checkpoint F16 tests. Preserve intermediate-layer checks when changing kernels. Synthetic F16 coverage is not a substitute for real-model F16 validation.
+2. **Upstream schema/decision surface.** Support multiple tasks per encoder pass, few-shot examples, explicit description ordering independent of label order, cross-task constraints and upstream exact/beam decoding. Match upstream decisions and tie-breaking before claiming full Python API parity.
+3. **Long documents and batching.** Add documented chunking/aggregation policies, variable-length batches and attention masks. Current token limits deliberately fail rather than silently dropping schema markers.
+4. **Performance.** Benchmark cold loading and steady-state CPU inference, then reduce attention-index memory, precompute immutable relative projections, introduce memory mapping and cache schema tokenization. Add backend selection and GPU/Metal after preserving F32 parity.
+5. **Quantization and packaging.** Establish separate error budgets for F16 and quantized weights; retain original tensors unless a new format version explicitly documents pruning. Add install/export targets and platform CI with installed, local and fetched GGML.
+
+NER/span/JSON extraction and alternate encoders are not part of the current classification runtime, even though their checkpoint tensors are preserved.

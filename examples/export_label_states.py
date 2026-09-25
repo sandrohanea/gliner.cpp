@@ -6,6 +6,7 @@ This is a parity tool, not part of the C++ runtime.
 """
 
 import argparse
+import sys
 from pathlib import Path
 
 import torch
@@ -19,12 +20,17 @@ def main():
     parser.add_argument("--task", required=True)
     parser.add_argument("--labels", nargs="+", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--threads", type=int, default=4)
     args = parser.parse_args()
 
-    model = AutoExtractor.from_pretrained(args.checkpoint)
+    if args.threads <= 0:
+        parser.error("--threads must be positive")
+    sys.stdout.reconfigure(encoding="utf-8")
+    torch.set_num_threads(args.threads)
+    model = AutoExtractor.from_pretrained(args.checkpoint, use_flashdeberta=False)
     model.eval()
     schema = {"classifications": [{"task": args.task, "labels": args.labels}]}
-    batch = model.processor.collate_fn_inference([(args.text, schema)])
+    batch = model.processor.collate_fn_inference([(args.text, schema)], error_policy="raise")
     device = next(model.parameters()).device
     batch = batch.to(device)
     with torch.inference_mode():
