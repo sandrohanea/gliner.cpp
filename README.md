@@ -1,5 +1,11 @@
 # gliner.cpp
 
+**Important:** 
+
+This project served as a successful proof of concept for native GLiNER inference. The port to llama.cpp builds on that work and places GLiNER2.5-Decide alongside the existing decision models. The effort is split into two dependent changes: general, opt-in Unicode NFC normalization for Unigram tokenizers, followed by the DeBERTa-v2/v3 encoder and GLiNER2.5-Decide classification head. NFC is required to match the reference tokenizer for canonically equivalent text. Follow the [upstream discussion](https://github.com/ggml-org/llama.cpp/discussions/30387) for the proposal and progress.
+
+---
+
 GGML/GGUF inference for [fastino/GLiNER2.5-Decide](https://huggingface.co/fastino/GLiNER2.5-Decide) text classification and grouped span extraction. CPU is the reference backend. Classification F32 CUDA parity has been reported on an RTX 4060 Laptop GPU under the precision settings below, and classification F32 Metal parity has been verified on an Apple M4 Pro. Native span extraction has CPU reference coverage; its GPU validation remains pending. Inference runs entirely in C++ from one GGUF file, including schema/tokenization, the DeBERTa encoder and task heads.
 
 Despite its name, the published checkpoint uses the **span** architecture. Its classification head is `Linear(H, 2H)`, ReLU, `Linear(2H, 1)` on contextual marker states, not standalone label embeddings.
